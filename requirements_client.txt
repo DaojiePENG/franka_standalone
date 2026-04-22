@@ -4,4 +4,5 @@ numpy
 scipy
 pynput
 opencv-python
+matplotlib
 pyrealsense2==2.54.2.5684

@@ -16,7 +16,7 @@ Controls:
     J/L   Yaw left / right
     I/K   Pitch up / down
     U/O   Roll left / right
-    Shift Hold for 3x speed
+    1-9   Set speed multiplier
     Z     Close gripper
     X     Open gripper
     C     Start recording episode
@@ -258,13 +258,13 @@ class KeyboardTeleop:
         'u': 'rol_l', 'o': 'rol_r',
     }
 
-    def __init__(self, pos_speed=0.08, rot_speed=0.3):
+    def __init__(self, pos_speed=0.08, rot_speed=0.3, speed_mult=3.0):
         self.pos_speed = pos_speed
         self.rot_speed = rot_speed
+        self.speed_mult = float(speed_mult)
         self._states = {v: False for v in self.KEY_MAP.values()}
         self.gripper_closing = False
         self.gripper_opening = False
-        self.shift_held = False
         self.quit_requested = False
         self.home_requested = False
         self.record_start = False
@@ -282,12 +282,12 @@ class KeyboardTeleop:
             return None
 
     def _press(self, key):
-        if key in (pynput_keyboard.Key.shift, pynput_keyboard.Key.shift_r):
-            self.shift_held = True
-            return
         c = self._char(key)
         if c in self.KEY_MAP:
             self._states[self.KEY_MAP[c]] = True
+        elif c is not None and c in '123456789':
+            self.speed_mult = float(c)
+            print(f"\n[Teleop] speed multiplier set to x{int(self.speed_mult)}")
         elif c == 'z':
             self.gripper_closing = True
         elif c == 'x':
@@ -304,9 +304,6 @@ class KeyboardTeleop:
             self.quit_requested = True
 
     def _release(self, key):
-        if key in (pynput_keyboard.Key.shift, pynput_keyboard.Key.shift_r):
-            self.shift_held = False
-            return
         c = self._char(key)
         if c in self.KEY_MAP:
             self._states[self.KEY_MAP[c]] = False
@@ -316,8 +313,7 @@ class KeyboardTeleop:
             self.gripper_opening = False
 
     def get_velocity(self, dt):
-        mult = 3.0 if self.shift_held else 1.0
-        s, ps, rs = self._states, self.pos_speed * mult, self.rot_speed * mult
+        s, ps, rs = self._states, self.pos_speed * self.speed_mult, self.rot_speed * self.speed_mult
         dp = np.zeros(3)
         if s['fwd']:   dp[0] += ps * dt
         if s['bwd']:   dp[0] -= ps * dt
@@ -466,6 +462,8 @@ def main():
     parser.add_argument('--frequency', type=int, default=CONTROL_FREQUENCY)
     parser.add_argument('--pos_speed', type=float, default=POS_SPEED)
     parser.add_argument('--rot_speed', type=float, default=ROT_SPEED)
+    parser.add_argument('--speed_mult', type=float, default=3.0,
+                        help='Default runtime speed multiplier; press 1-9 during teleop to change it')
     parser.add_argument('--no_l515', action='store_true',
                         help='Disable L515 cameras')
     parser.add_argument('--no_fisheye', action='store_true',
@@ -502,7 +500,11 @@ def main():
 
     # ---- Robot ----
     robot = FrankaClient(args.robot_ip, args.robot_port)
-    teleop = KeyboardTeleop(pos_speed=args.pos_speed, rot_speed=args.rot_speed)
+    teleop = KeyboardTeleop(
+        pos_speed=args.pos_speed,
+        rot_speed=args.rot_speed,
+        speed_mult=args.speed_mult,
+    )
     recorder = EpisodeRecorder(args.output)
 
     print("=" * 60)
@@ -511,10 +513,11 @@ def main():
     print(f"  L515:      {len(l515_cams)} cameras")
     print(f"  Fisheye:   {'yes' if fisheye_cam else 'no'}")
     print(f"  Freq:      {args.frequency} Hz")
+    print(f"  Speed x:   {args.speed_mult:.1f} (press 1-9 to change)")
     print(f"  Output:    {args.output}")
     print("=" * 60)
     print("  C = start recording, V = stop & save, B = drop")
-    print("  WASD = move, Z/X = gripper, H = home, Esc = quit")
+    print("  WASD = move, 1-9 = speed, Z/X = gripper, H = home, Esc = quit")
     print("=" * 60)
 
     try:
