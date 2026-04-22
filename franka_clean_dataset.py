@@ -185,12 +185,22 @@ def build_keep_mask(actions, timestamps, pose_velocity_threshold,
 
 def filtered_episode_data(episode_data, keep_mask):
     kept_indices = np.flatnonzero(keep_mask)
+    original_timestamps = episode_data['timestamps'][keep_mask]
+    if len(episode_data['timestamps']) > 1:
+        nominal_dt = float(np.median(np.diff(episode_data['timestamps'])))
+    else:
+        nominal_dt = 0.1
+    nominal_dt = max(nominal_dt, 1e-6)
+    cleaned_timestamps = original_timestamps[0] + np.arange(len(original_timestamps)) * nominal_dt
+
     filtered = {
-        'timestamps': episode_data['timestamps'][keep_mask],
+        'timestamps': cleaned_timestamps,
+        'source_timestamps': original_timestamps,
         'actions': episode_data['actions'][keep_mask],
         'robot_states': episode_data['robot_states'][keep_mask],
         'joint_positions': episode_data['joint_positions'][keep_mask],
         'original_indices': kept_indices,
+        'nominal_dt': nominal_dt,
     }
     return filtered
 
@@ -227,10 +237,12 @@ def save_cleaned_episode(dst_episode_dir, filtered_data):
     np.savez_compressed(
         dst_episode_dir / 'robot_data.npz',
         timestamps=filtered_data['timestamps'],
+        source_timestamps=filtered_data['source_timestamps'],
         actions=filtered_data['actions'],
         robot_states=filtered_data['robot_states'],
         joint_positions=filtered_data['joint_positions'],
         original_indices=filtered_data['original_indices'],
+        nominal_dt=np.array(filtered_data['nominal_dt'], dtype=np.float64),
     )
 
 
