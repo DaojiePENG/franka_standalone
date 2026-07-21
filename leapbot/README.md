@@ -171,7 +171,9 @@ python leapbot_control.py --server_ip <IP> \
 
 ---
 
-## 3. 启动步骤
+## 3. 启动步骤（快速参考）
+
+完整的端到端实验流程见 [第 5 节](#5-实验流程)，以下是各组件的单独启动说明。
 
 ### 步骤 1：启动 Franka 底层服务（NUC 终端 1）
 
@@ -186,64 +188,20 @@ bash launch_polymetis.sh     # 保持运行
 ```bash
 conda activate vj_fw
 cd /home/aihub/daojie/franka_standalone/leapbot
-
-# 默认配置
-bash launch_server.sh
-
-# 自定义配置
-ASSET_ROOT=/path/to/assets \
-TASK=move_objects_into_box \
-bash launch_server.sh
+bash launch_server.sh        # 可通过环境变量自定义，见第 6 节
 ```
 
-等待看到：
-
-```
-[Server] Model loaded successfully!
-[Server] Starting uvicorn on 0.0.0.0:8000
-```
-
-验证：
-
-```bash
-curl http://localhost:8000/ready
-```
+验证：`curl http://localhost:8000/ready`
 
 ### 步骤 3：启动机器人闭环控制（NUC 终端 2）
 
 ```bash
 conda activate polymetis
 cd /path/to/franka_standalone/leapbot
-
-# 方式 A：使用启动脚本（自动启动 franka_server.py）
 SERVER_IP=<GPU机器IP> bash launch_leapbot.sh
-
-# 方式 B：手动启动（如 franka_server.py 已在运行）
-python leapbot_control.py \
-    --server_ip <GPU机器IP> \
-    --task move_objects_into_box
 ```
 
-启动后进入 **IDLE** 状态，显示所有可用键盘控制：
-
-```
-═══════════════════════════════════════════════════════════════════
-  Keyboard controls:
-    S        Start / resume policy
-    Space    Pause / resume toggle
-    B        Stop policy → IDLE
-    N / →    Single-step one action
-    Esc      Emergency stop (+ open gripper)
-    H        Reset to home
-    Z / X    Close / open gripper
-    + / -    Adjust action horizon
-    V        Toggle camera viz
-    M        Print current state
-    Q        Quit gracefully
-═══════════════════════════════════════════════════════════════════
-
-  State: IDLE  —  press S to start
-```
+启动后进入 **IDLE** 状态，显示键盘控制说明（见第 4 节）。
 
 ---
 
@@ -303,32 +261,120 @@ python leapbot_control.py \
 
 ---
 
-## 5. 推荐实验流程
+## 5. 实验流程
 
-### 首次实验（保守模式）
+完整实验流程按顺序分为 5 个阶段。**首次使用必须从阶段 1 开始。**
+
+---
+
+### 阶段 1：工作空间标定（仅首次 / 每次调整工位后）
+
+**前置条件**：polymetis + franka_server.py 已启动（步骤 1）
 
 ```bash
-# 启动时用小 horizon 和小 delta 限制
-SERVER_IP=192.168.1.100 \
+conda activate polymetis
+cd /path/to/franka_standalone/leapbot
+python calibrate_workspace.py --robot_ip localhost --margin 0.02
+```
+
+操作流程：
+
+1. 机器人自动归零到 Home 位
+2. 用 **WASD/QE** 手动推到工作空间的每个极限位置：
+   - **W** 推到最远前方 → 记录 x_max
+   - **S** 推到最后方 → 记录 x_min
+   - **A** 推到最左 → 记录 y_max
+   - **D** 推到最右 → 记录 y_min
+   - **Q** 推到最高 → 记录 z_max
+   - **E** 推到最低 → 记录 z_min
+3. 每个极限位置**停留 1 秒**，让跟踪器记录
+4. 按 **T** 预览当前边界，按 **R** 可重置重来
+5. 全部标定完毕后按 **P** 输出结果：
+
+```
+============================================================
+    x_min=0.2500, x_max=0.6200,
+    y_min=-0.3500, y_max=0.3200,
+    z_min=0.0800, z_max=0.5000,
+============================================================
+```
+
+6. 按 **Esc** 退出标定工具
+
+**记录这些值**，后续启动控制器时通过环境变量传入（见阶段 3）。
+
+> `--margin 0.02` 会在你到达的极限位置基础上再往内缩 2cm。
+> 建议标定 2-3 次取交集，确保边界稳定。
+
+---
+
+### 阶段 2：启动 GPU 推理服务器
+
+在 **GPU 机器**上（只需启动一次，切换任务时重启）：
+
+```bash
+conda activate vj_fw
+cd /home/aihub/daojie/franka_standalone/leapbot
+bash launch_server.sh
+```
+
+等待看到：
+
+```
+[Server] Model loaded successfully!
+[Server] Starting uvicorn on 0.0.0.0:8000
+```
+
+---
+
+### 阶段 3：启动闭环控制器（首次实验 — 保守模式）
+
+在 **NUC** 终端上，使用标定得到的安全边界 + 保守控制参数：
+
+```bash
+conda activate polymetis
+cd /path/to/franka_standalone/leapbot
+
+# 将标定输出的值填入下方环境变量
+SERVER_IP=<GPU机器IP> \
 ACTION_HORIZON=1 \
 MAX_DELTA_POS=0.03 \
 MAX_DELTA_ROT=0.15 \
+SAFETY_X_MIN=0.25 SAFETY_X_MAX=0.62 \
+SAFETY_Y_MIN=-0.35 SAFETY_Y_MAX=0.32 \
+SAFETY_Z_MIN=0.08 SAFETY_Z_MAX=0.50 \
 bash launch_leapbot.sh
 ```
 
-1. 系统启动后进入 **IDLE**，确认相机画面正常
-2. 按 **M** 查看当前位姿，确认在安全范围内
-3. 按 **S** 启动策略，观察机器人动作
-4. **随时准备按 Esc** 急停
-5. 如果动作合理，按 **Space** 暂停，用 **+** 增大 horizon
-6. 按 **S** 继续，逐步放宽限制
+> 首次实验务必用 `ACTION_HORIZON=1`（纯 receding horizon）+ 小 `MAX_DELTA_POS`，
+> 观察策略行为稳定后再逐步放宽。
 
-### 标准实验
+---
+
+### 阶段 4：验证与调试
+
+系统启动后进入 **IDLE** 状态，按以下顺序验证：
+
+1. **检查相机画面** — 确认 4 个相机图像正常显示
+2. **按 M** — 查看当前末端位姿，确认在标定的安全范围内
+3. **按 N（单步）** — 执行一个动作，观察机器人是否按预期运动
+4. 单步合理后，**按 S** — 进入连续运行模式
+5. **随时准备按 Esc** — 急停（立即停止 + 打开夹爪）
+6. 动作稳定后按 **Space** 暂停，用 **+** 增大 horizon，再按 **S** 继续
+
+---
+
+### 阶段 5：正式实验
+
+确认策略行为合理后，使用正常参数：
 
 ```bash
-SERVER_IP=192.168.1.100 \
+SERVER_IP=<GPU机器IP> \
 TASK=move_objects_into_box \
 ACTION_HORIZON=4 \
+SAFETY_X_MIN=0.25 SAFETY_X_MAX=0.62 \
+SAFETY_Y_MIN=-0.35 SAFETY_Y_MAX=0.32 \
+SAFETY_Z_MIN=0.08 SAFETY_Z_MAX=0.50 \
 bash launch_leapbot.sh
 ```
 
@@ -336,22 +382,23 @@ bash launch_leapbot.sh
 2. 按 **S** 启动策略
 3. 观察机器人执行任务
 4. 按 **Space** 暂停检查，**S** 继续
-5. 按 **B** 停止策略（保持位姿），**Q** 退出
+5. 任务完成或需要停止时，按 **B** 停止策略（保持位姿），**Q** 退出
+
+---
 
 ### 切换相机配置
 
-```bash
-# 实验 A
-SERVER_IP=192.168.1.100 \
-CAM_GLOBAL=zed_0 \
-CAM_WRIST=fisheye \
-bash launch_leapbot.sh
+不同任务可能需要不同的视角组合，通过环境变量切换：
 
-# 实验 B（不同视角组合）
-SERVER_IP=192.168.1.100 \
-CAM_GLOBAL=zed_1 \
-CAM_WRIST=l515_0 \
-bash launch_leapbot.sh
+```bash
+# 实验 A：默认视角（zed_0 全局 + fisheye 手腕）
+CAM_GLOBAL=zed_0 CAM_WRIST=fisheye bash launch_leapbot.sh
+
+# 实验 B：zed_1 全局 + l515_0 手腕
+CAM_GLOBAL=zed_1 CAM_WRIST=l515_0 bash launch_leapbot.sh
+
+# 实验 C：只用双 ZED，禁用 fisheye 和 L515
+CAM_GLOBAL=zed_0 CAM_WRIST=zed_1 bash launch_leapbot.sh
 ```
 
 ---
@@ -459,7 +506,8 @@ franka_standalone/leapbot/
 ├── launch_server.sh        # GPU 服务器启动脚本（conda vj_fw）
 ├── leapbot_client.py       # NUC 侧推理 HTTP 客户端
 ├── leapbot_control.py      # NUC 侧闭环控制主脚本（完整键盘控制）
-└── launch_leapbot.sh       # NUC 侧启动脚本（franka_server + 控制器）
+├── launch_leapbot.sh       # NUC 侧启动脚本（franka_server + 控制器）
+└── calibrate_workspace.py  # 工作空间标定工具（实验前必用）
 ```
 
 ---
