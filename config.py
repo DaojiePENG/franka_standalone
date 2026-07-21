@@ -9,9 +9,20 @@ ROBOT_IP = '192.168.3.2'       # NUC IP (runs franka_server.py)
 ROBOT_PORT = 4242              # ZeroRPC server port
 
 # ==================== Camera ====================
-L515_SERIALS = ['f1480807', 'f1471315']   # Intel RealSense L515 serial numbers
+L515_SERIALS = ['f1480807']               # Intel RealSense L515 serial (L515-0 / wrist)
 FISHEYE_USB_ID = '32e4:9230'              # USB vendor:product ID for fisheye camera
 FISHEYE_RESOLUTION = (640, 480)
+
+# ---- ZED stereo cameras ----
+# Each ZED is grabbed in its own spawned process (pyzed lives in the umi env)
+# and published to the collector via shared memory, so ZED capture never stalls
+# the gevent/zerorpc control loop; see franka_collect.ZEDCamera / _zed_worker.
+# Leave ZED_SERIALS empty to auto-detect every connected ZED (enumerated via
+# pyzed.sl.Camera.get_device_list() and opened in ascending serial order as
+# zed_0, zed_1, ...). Provide serials to pin an explicit set/ordering instead.
+ZED_SERIALS = [17791214, 17160981]        # zed_0, zed_1 (ascending serial)
+ZED_RESOLUTION = 'VGA'                  # HD720 / HD1080 / VGA ...
+ZED_FPS = 30
 
 # ==================== Robot Control ====================
 CONTROL_FREQUENCY = 10         # Hz
@@ -47,7 +58,10 @@ KXD_DEFAULT = np.array([37.0, 37.0, 37.0, 2.0, 2.0, 2.0])
 import scipy.spatial.transform as st
 
 _tx_flange_tip_trans = np.identity(4)
-_tx_flange_tip_trans[:3, 3] = np.array([0, 0, 0.1034])
+# 2026-07-04 变更:0.1034 -> 0.1084(法兰与 Franka Hand 之间的 5 mm 腕部
+# 相机安装件计入 TCP;与 umi/real_world/franka_interpolation_controller.py
+# 的 tx_flange_tip 保持一致,详见 calibration_data/README.md)
+_tx_flange_tip_trans[:3, 3] = np.array([0, 0, 0.1084])
 
 _tx_flange_rot45 = np.identity(4)
 _tx_flange_rot45[:3, :3] = st.Rotation.from_euler('z', [-np.pi / 4]).as_matrix()

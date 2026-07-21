@@ -16,15 +16,16 @@ Controls:
     J/L   Yaw left / right
     I/K   Pitch up / down
     U/O   Roll left / right
-    1-9   Set speed multiplier
-    Z     Close gripper
-    X     Open gripper
+    Shift Hold for 3x speed
+    Z     Close gripper (full)
+    X     Open gripper (full)
     H     Reset to home
     Esc   Quit
 """
 import argparse
 import time
 import sys
+import threading
 
 import numpy as np
 import scipy.spatial.transform as st
@@ -33,7 +34,7 @@ from pynput import keyboard as pynput_keyboard
 
 from config import (
     ROBOT_IP, ROBOT_PORT, CONTROL_FREQUENCY,
-    POS_SPEED, ROT_SPEED, MAX_GRIPPER_WIDTH,
+    POS_SPEED, ROT_SPEED, MAX_GRIPPER_WIDTH, GRIPPER_SPEED,
     EE_HOME_POSE, HOME_MOVE_DURATION,
     FRANKA_HOME_JOINTS, JOINTS_HOME_DURATION,
     KX_DEFAULT, KXD_DEFAULT,
@@ -105,8 +106,53 @@ class FrankaClient:
     def gripper_release(self, speed=0.2):
         return self._c.gripper_release(float(speed))
 
+    def gripper_move(self, width, speed=0.2):
+        """Position move to width (m); server stops any previous motion itself."""
+        return self._c.gripper_move(float(width), float(speed))
+
+    def gripper_stop(self):
+        """Interrupt in-flight gripper motion; returns settled state dict (width m)."""
+        return self._c.gripper_stop()
+
     def close(self):
         self._c.close()
+
+
+# ==================== Async Gripper Dispatch ====================
+# Gripper grasp/release block on the server until the motion settles. Firing
+# them on the shared control client would stall the pose loop for the whole
+# motion, so (mirroring demo_franka_keyboard_wrist_L515_dual_zed.py's
+# _async_gripper_cmd) each command runs fire-and-forget on a fresh per-call
+# zerorpc client, serialized by a lock so concurrent presses never interleave.
+_gripper_lock = threading.Lock()
+
+
+def _async_gripper_cmd(robot_ip, robot_port, action, *,
+                       speed=GRIPPER_SPEED, force=40.0, width=0.0):
+    def _run():
+        with _gripper_lock:
+            try:
+                client = zerorpc.Client(heartbeat=20, timeout=5)
+                client.connect(f"tcp://{robot_ip}:{int(robot_port)}")
+                try:
+                    if action == 'grasp':
+                        client.gripper_grasp(float(speed), float(force))
+                    elif action == 'release':
+                        client.gripper_release(float(speed))
+                    elif action == 'move':
+                        client.gripper_move(float(width), float(speed))
+                    elif action == 'stop':
+                        client.gripper_stop()
+                    else:
+                        print(f"[GRIPPER] unknown async action: {action!r}")
+                finally:
+                    try:
+                        client.close()
+                    except Exception:
+                        pass
+            except Exception as e:
+                print(f"[GRIPPER] async {action} failed: {e}")
+    threading.Thread(target=_run, daemon=True).start()
 
 
 # ======================== Keyboard Handler ========================
@@ -122,13 +168,22 @@ class KeyboardTeleop:
         'u': 'rol_l', 'o': 'rol_r',
     }
 
-    def __init__(self, pos_speed=0.08, rot_speed=0.3, speed_mult=3.0):
+    def __init__(self, pos_speed=0.08, rot_speed=0.3):
         self.pos_speed = pos_speed
         self.rot_speed = rot_speed
-        self.speed_mult = float(speed_mult)
         self._states = {v: False for v in self.KEY_MAP.values()}
-        self.gripper_closing = False
-        self.gripper_opening = False
+        # One-shot gripper requests: set True on a genuine Z/X DOWN-edge and
+        # consumed (cleared) exactly once by the control loop. X11 key
+        # auto-repeat replays a synthetic release+press pair per repeat while a
+        # key is held, which naive press-edge detection would read as many
+        # presses. We reject any press that lands within _gripper_debounce of
+        # the last release of the same key, so one physical press = one request.
+        self.gripper_close_req = False
+        self.gripper_open_req = False
+        self._z_last_release = 0.0
+        self._x_last_release = 0.0
+        self._gripper_debounce = 0.05
+        self.shift_held = False
         self.quit_requested = False
         self.home_requested = False
 
@@ -143,32 +198,38 @@ class KeyboardTeleop:
             return None
 
     def _press(self, key):
+        if key in (pynput_keyboard.Key.shift, pynput_keyboard.Key.shift_r):
+            self.shift_held = True
+            return
         c = self._char(key)
         if c in self.KEY_MAP:
             self._states[self.KEY_MAP[c]] = True
-        elif c is not None and c in '123456789':
-            self.speed_mult = float(c)
-            print(f"\n[Teleop] speed multiplier set to x{int(self.speed_mult)}")
         elif c == 'z':
-            self.gripper_closing = True
+            if time.monotonic() - self._z_last_release > self._gripper_debounce:
+                self.gripper_close_req = True
         elif c == 'x':
-            self.gripper_opening = True
+            if time.monotonic() - self._x_last_release > self._gripper_debounce:
+                self.gripper_open_req = True
         elif c == 'h':
             self.home_requested = True
         if key == pynput_keyboard.Key.esc:
             self.quit_requested = True
 
     def _release(self, key):
+        if key in (pynput_keyboard.Key.shift, pynput_keyboard.Key.shift_r):
+            self.shift_held = False
+            return
         c = self._char(key)
         if c in self.KEY_MAP:
             self._states[self.KEY_MAP[c]] = False
         elif c == 'z':
-            self.gripper_closing = False
+            self._z_last_release = time.monotonic()
         elif c == 'x':
-            self.gripper_opening = False
+            self._x_last_release = time.monotonic()
 
     def get_velocity(self, dt):
-        s, ps, rs = self._states, self.pos_speed * self.speed_mult, self.rot_speed * self.speed_mult
+        mult = 3.0 if self.shift_held else 1.0
+        s, ps, rs = self._states, self.pos_speed * mult, self.rot_speed * mult
         dp = np.zeros(3)
         if s['fwd']:   dp[0] += ps * dt
         if s['bwd']:   dp[0] -= ps * dt
@@ -231,8 +292,6 @@ def main():
     parser.add_argument('--frequency', type=int, default=CONTROL_FREQUENCY)
     parser.add_argument('--pos_speed', type=float, default=POS_SPEED)
     parser.add_argument('--rot_speed', type=float, default=ROT_SPEED)
-    parser.add_argument('--speed_mult', type=float, default=3.0,
-                        help='Default runtime speed multiplier; press 1-9 during teleop to change it')
     parser.add_argument('--init_home', action='store_true', default=True,
                         help='Reset to home on start')
     args = parser.parse_args()
@@ -241,19 +300,14 @@ def main():
     print("  Franka Keyboard Control (上位机, no camera)")
     print(f"  Server: {args.robot_ip}:{args.robot_port}")
     print(f"  Freq:   {args.frequency} Hz")
-    print(f"  Speed x:{args.speed_mult:.1f} (press 1-9 to change)")
     print("=" * 55)
 
     robot = FrankaClient(args.robot_ip, args.robot_port)
-    teleop = KeyboardTeleop(
-        pos_speed=args.pos_speed,
-        rot_speed=args.rot_speed,
-        speed_mult=args.speed_mult,
-    )
+    teleop = KeyboardTeleop(pos_speed=args.pos_speed, rot_speed=args.rot_speed)
 
     try:
         # start impedance controller
-        robot.start_carteqeuiojklzxsian_impedance()
+        robot.start_cartesian_impedance()
         print("[Init] Cartesian impedance started.")
 
         if args.init_home:
@@ -263,7 +317,8 @@ def main():
         gripper_pos = MAX_GRIPPER_WIDTH
         robot.gripper_release()
 
-        print("\nReady! Use WASD to move, 1-9 speed, Z/X gripper, H home, Esc quit.")
+        print("\nReady! WASD to move; Z close gripper, X open gripper; "
+              "H home, Esc quit.")
         dt = 1.0 / args.frequency
         last_print = 0.0
 
@@ -286,12 +341,26 @@ def main():
             # send to robot
             robot.update_desired_ee_pose(target_pose)
 
-            # gripper
-            if teleop.gripper_closing and gripper_pos > 0.01:
-                robot.gripper_grasp()
+            # gripper: full close / open, one dispatch per Z/X press edge. Z =
+            # full force-close (grasp), X = full open (release). The DOWN-edge
+            # is detected in KeyboardTeleop (auto-repeat debounced) and delivered
+            # as a one-shot request, so a single press fires exactly one motion.
+            # Dispatch is async (fire-and-forget) so the blocking gripper RPC
+            # never stalls the pose loop; gripper_pos is a pure input-driven cmd,
+            # feedback never writes it. Print only on an actual target change.
+            if teleop.gripper_close_req:
+                teleop.gripper_close_req = False
+                _async_gripper_cmd(args.robot_ip, args.robot_port, 'grasp',
+                                   speed=GRIPPER_SPEED, force=40.0)
+                if gripper_pos != 0.0:
+                    print("\n[GRIPPER] full force-close dispatched")
                 gripper_pos = 0.0
-            elif teleop.gripper_opening and gripper_pos < 0.07:
-                robot.gripper_release()
+            elif teleop.gripper_open_req:
+                teleop.gripper_open_req = False
+                _async_gripper_cmd(args.robot_ip, args.robot_port, 'release',
+                                   speed=GRIPPER_SPEED)
+                if gripper_pos != MAX_GRIPPER_WIDTH:
+                    print("\n[GRIPPER] full open dispatched")
                 gripper_pos = MAX_GRIPPER_WIDTH
 
             # terminal print (2 Hz)

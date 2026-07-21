@@ -2,3 +2,4 @@ __pycache__
 collected_data*
 .vscode
 data_*/
+data/

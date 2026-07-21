@@ -2,8 +2,13 @@
 """
 Franka 上位机 — Keyboard teleop + multi-camera data collection.
 
-Connects to franka_server.py via ZeroRPC, streams L515 RGB-D + fisheye images,
-and records episodes to disk (numpy .npz per episode).
+Connects to franka_server.py via ZeroRPC, streams L515 RGB-D + fisheye + ZED
+stereo images, and records episodes to disk (numpy .npz per episode). Each ZED
+runs in its OWN spawned process (pyzed is installed in the umi env) and
+publishes the latest left-view RGB frame to the parent via shared memory, so
+pyzed grab()/retrieve_image() never hold the parent GIL and can never starve
+the gevent/zerorpc control client. ZEDs are auto-detected from the bus; see
+ZEDCamera and _zed_worker.
 
 Usage:
     python franka_collect.py -o ./data
@@ -16,9 +21,9 @@ Controls:
     J/L   Yaw left / right
     I/K   Pitch up / down
     U/O   Roll left / right
-    1-9   Set speed multiplier
-    Z     Close gripper
-    X     Open gripper
+    Shift Hold for 3x speed
+    Z     Close gripper (full)
+    X     Open gripper (full)
     C     Start recording episode
     V     Stop recording & save episode
     B     Drop (discard) current episode
@@ -26,26 +31,27 @@ Controls:
     Esc   Quit
 """
 import argparse
-import os
 import time
 import threading
 import subprocess
+import multiprocessing as mp
+from multiprocessing import shared_memory
 from pathlib import Path
 
 import cv2
 import numpy as np
 import scipy.spatial.transform as st
 import zerorpc
-from pynput import keyboard as pynput_keyboard
 
 from config import (
     ROBOT_IP, ROBOT_PORT, CONTROL_FREQUENCY,
-    POS_SPEED, ROT_SPEED, MAX_GRIPPER_WIDTH,
+    POS_SPEED, ROT_SPEED, MAX_GRIPPER_WIDTH, GRIPPER_SPEED,
     EE_HOME_POSE, HOME_MOVE_DURATION,
     FRANKA_HOME_JOINTS, JOINTS_HOME_DURATION,
     KX_DEFAULT, KXD_DEFAULT,
     TX_FLANGE_TIP, TX_TIP_FLANGE,
     L515_SERIALS, FISHEYE_USB_ID, FISHEYE_RESOLUTION,
+    ZED_SERIALS, ZED_RESOLUTION, ZED_FPS,
 )
 
 
@@ -61,6 +67,18 @@ def mat_to_pose(mat):
     pos = mat[:3, 3]
     rot = st.Rotation.from_matrix(mat[:3, :3]).as_rotvec()
     return np.concatenate([pos, rot])
+
+
+def precise_wait(t_end, slack_time=0.001):
+    """Sleep until monotonic time reaches t_end, spinning for the final slack
+    to minimise jitter (equivalent to umi.common.precise_sleep.precise_wait)."""
+    t_wait = t_end - time.monotonic()
+    if t_wait > 0:
+        t_sleep = t_wait - slack_time
+        if t_sleep > 0:
+            time.sleep(t_sleep)
+        while time.monotonic() < t_end:
+            pass
 
 
 # ======================== ZeroRPC Client ========================
@@ -104,8 +122,53 @@ class FrankaClient:
     def gripper_release(self, speed=0.2):
         return self._c.gripper_release(float(speed))
 
+    def gripper_move(self, width, speed=0.2):
+        """Position move to width (m); server stops any previous motion itself."""
+        return self._c.gripper_move(float(width), float(speed))
+
+    def gripper_stop(self):
+        """Interrupt in-flight gripper motion; returns settled state dict (width m)."""
+        return self._c.gripper_stop()
+
     def close(self):
         self._c.close()
+
+
+# ==================== Async Gripper Dispatch ====================
+# Gripper grasp/release block on the server until the motion settles. Firing
+# them on the shared control client would stall the 20 Hz pose loop for the
+# whole motion, so (mirroring demo_franka_keyboard_wrist_L515_dual_zed.py's
+# _async_gripper_cmd) each command runs fire-and-forget on a fresh per-call
+# zerorpc client, serialized by a lock so concurrent presses never interleave.
+_gripper_lock = threading.Lock()
+
+
+def _async_gripper_cmd(robot_ip, robot_port, action, *,
+                       speed=GRIPPER_SPEED, force=40.0, width=0.0):
+    def _run():
+        with _gripper_lock:
+            try:
+                client = zerorpc.Client(heartbeat=20, timeout=5)
+                client.connect(f"tcp://{robot_ip}:{int(robot_port)}")
+                try:
+                    if action == 'grasp':
+                        client.gripper_grasp(float(speed), float(force))
+                    elif action == 'release':
+                        client.gripper_release(float(speed))
+                    elif action == 'move':
+                        client.gripper_move(float(width), float(speed))
+                    elif action == 'stop':
+                        client.gripper_stop()
+                    else:
+                        print(f"[GRIPPER] unknown async action: {action!r}")
+                finally:
+                    try:
+                        client.close()
+                    except Exception:
+                        pass
+            except Exception as e:
+                print(f"[GRIPPER] async {action} failed: {e}")
+    threading.Thread(target=_run, daemon=True).start()
 
 
 # ======================== Cameras ========================
@@ -190,11 +253,33 @@ class FisheyeCamera:
         self._color = None
         self._running = False
 
-        self._cap = cv2.VideoCapture(device)
-        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        # Force the V4L2 backend: a plain VideoCapture(str) opens via FFMPEG on
+        # OpenCV 4.13, where CAP_PROP_FRAME_WIDTH/HEIGHT are silently ignored and
+        # the capture keeps the driver's residual format. V4L2 + an explicit
+        # FOURCC forces a fresh negotiation to the requested resolution.
+        self._cap = cv2.VideoCapture(device, cv2.CAP_V4L2)
         if not self._cap.isOpened():
             raise RuntimeError(f"Cannot open camera {device}")
+
+        # Prefer YUYV (this camera natively supports YUYV 640x480@30); only fall
+        # back to MJPG if the driver refuses the requested size under YUYV.
+        self._cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'YUYV'))
+        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        self._cap.set(cv2.CAP_PROP_FPS, 30)
+
+        actual_w = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        actual_h = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        if actual_w != width or actual_h != height:
+            self._cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+            self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+            self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+            actual_w = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            actual_h = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        fourcc = (int(self._cap.get(cv2.CAP_PROP_FOURCC)) & 0xFFFFFFFF
+                  ).to_bytes(4, 'little').decode(errors='ignore')
+        print(f"[Camera] Fisheye {device}: {fourcc} {actual_w}x{actual_h}")
 
         self._running = True
         self._thread = threading.Thread(target=self._loop, daemon=True)
@@ -216,6 +301,215 @@ class FisheyeCamera:
         self._running = False
         self._thread.join(timeout=2)
         self._cap.release()
+
+
+def detect_zed_serials():
+    """Return connected ZED serials in ascending order (empty on none/error)."""
+    try:
+        import pyzed.sl as sl
+    except ImportError as e:
+        raise RuntimeError(
+            "pyzed is not importable in this environment; ZED capture requires "
+            "pyzed installed in umi (e.g. `python -c 'import pyzed.sl'`)") from e
+    serials = []
+    for dev in sl.Camera.get_device_list():
+        try:
+            serials.append(int(dev.serial_number))
+        except (TypeError, ValueError):
+            pass
+    return sorted(s for s in serials if s)
+
+
+_ZED_RESOLUTION_MAP = {
+    'HD2K': (2208, 1242), 'HD1080': (1920, 1080),
+    'HD720': (1280, 720), 'VGA': (672, 376),
+}
+
+# Child-process status codes shared with the parent via a spawn-context Value.
+_ZED_OPENING, _ZED_READY, _ZED_FAILED = 0, 1, -1
+
+
+def _zed_worker(serial, resolution, fps, shm_name, shape, lock, seq, status,
+                stop_event):
+    """ZED grab loop, run in a dedicated spawn process (top-level so it is
+    picklable under the 'spawn' start method).
+
+    Opens the camera with a FRESH pyzed/CUDA context in this process, then
+    continuously grabs the left view and copies the latest RGB frame into the
+    shared-memory buffer under ``lock`` (bumping ``seq``). All the blocking C
+    pyzed calls and the GIL they hold stay in THIS process, so the parent's
+    gevent hub (which drives the zerorpc control client) is never starved."""
+    try:
+        import pyzed.sl as sl
+    except Exception:
+        status.value = _ZED_FAILED
+        return
+
+    cam = None
+    try:
+        res_enum = getattr(sl.RESOLUTION, str(resolution).strip().upper(), None)
+        if res_enum is None:
+            status.value = _ZED_FAILED
+            return
+        cam = sl.Camera()
+        init = sl.InitParameters()
+        init.camera_resolution = res_enum
+        init.camera_fps = int(fps)
+        init.depth_mode = sl.DEPTH_MODE.NONE
+        try:
+            init.coordinate_units = sl.UNIT.METER
+        except Exception:
+            pass
+        if serial not in (None, ''):
+            init.set_from_serial_number(int(serial))
+        if cam.open(init) != sl.ERROR_CODE.SUCCESS:
+            try:
+                cam.close()
+            except Exception:
+                pass
+            status.value = _ZED_FAILED
+            return
+    except Exception:
+        if cam is not None:
+            try:
+                cam.close()
+            except Exception:
+                pass
+        status.value = _ZED_FAILED
+        return
+
+    # Attach to the parent's segment. Under 'spawn' the child shares the
+    # parent's resource_tracker, so the parent (creator) is the SOLE owner: it
+    # unlinks on stop() and the tracker reclaims the segment if the parent is
+    # hard-killed. The child only close()s its view (never unlink) to avoid a
+    # double-unregister.
+    shm = shared_memory.SharedMemory(name=shm_name)
+    buf = np.ndarray(shape, dtype=np.uint8, buffer=shm.buf)
+    runtime = sl.RuntimeParameters()
+    left_mat = sl.Mat()
+    status.value = _ZED_READY
+    try:
+        while not stop_event.is_set():
+            if cam.grab(runtime) != sl.ERROR_CODE.SUCCESS:
+                continue
+            cam.retrieve_image(left_mat, sl.VIEW.LEFT)
+            arr = np.asarray(left_mat.get_data())
+            if arr.ndim == 3 and arr.shape[2] == 4:
+                rgb = cv2.cvtColor(arr, cv2.COLOR_BGRA2RGB)
+            else:
+                rgb = cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
+            if rgb.shape != shape:
+                rgb = cv2.resize(rgb, (shape[1], shape[0]))
+            with lock:
+                buf[:] = rgb
+                seq.value += 1
+    finally:
+        try:
+            cam.close()
+        except Exception:
+            pass
+        try:
+            shm.close()
+        except Exception:
+            pass
+
+
+class ZEDCamera:
+    """Process-isolated ZED stereo camera reader.
+
+    Each ZED is opened in its OWN 'spawn' subprocess (_zed_worker), which owns
+    the pyzed/CUDA context and does all grab()/retrieve_image() work; the latest
+    left-view RGB frame is published to this parent via a shared-memory buffer.
+    The parent never touches pyzed, so the blocking C calls / GIL contention
+    that previously starved the gevent-based zerorpc control client are gone.
+
+    Public contract is unchanged from the old thread-based reader: construct by
+    serial (+ resolution/fps), loop-free .get() returning the latest left RGB
+    uint8 frame (or None), and .stop() that cleanly tears down the child."""
+
+    _RESOLUTION_MAP = _ZED_RESOLUTION_MAP
+
+    def __init__(self, serial=None, resolution='HD720', fps=30,
+                 open_timeout=30.0):
+        self.serial = serial
+        res_name = str(resolution).strip().upper()
+        if res_name not in self._RESOLUTION_MAP:
+            raise ValueError(f"[ZED] unknown resolution {resolution!r}; "
+                             f"expected one of {list(self._RESOLUTION_MAP)!r}")
+        w, h = self._RESOLUTION_MAP[res_name]
+        self._shape = (h, w, 3)
+        self._proc = None
+        self._shm = None
+
+        # spawn (NOT fork): the child must initialise pyzed/CUDA fresh; forking
+        # after any CUDA use in the parent can hang or crash.
+        ctx = mp.get_context('spawn')
+        self._lock = ctx.Lock()
+        self._seq = ctx.Value('L', 0)
+        self._status = ctx.Value('i', _ZED_OPENING)
+        self._stop_event = ctx.Event()
+        self._last_seq = 0
+
+        nbytes = int(np.prod(self._shape))
+        self._shm = shared_memory.SharedMemory(create=True, size=nbytes)
+        self._buf = np.ndarray(self._shape, dtype=np.uint8, buffer=self._shm.buf)
+
+        self._proc = ctx.Process(
+            target=_zed_worker,
+            args=(serial, res_name, int(fps), self._shm.name, self._shape,
+                  self._lock, self._seq, self._status, self._stop_event),
+            daemon=True)
+        self._proc.start()
+
+        deadline = time.monotonic() + float(open_timeout)
+        while time.monotonic() < deadline:
+            child_status = self._status.value
+            if child_status == _ZED_READY:
+                break
+            if child_status == _ZED_FAILED or not self._proc.is_alive():
+                self._cleanup()
+                raise RuntimeError(
+                    f"[ZED {serial}] child process failed to open camera "
+                    f"(pyzed missing or camera busy)")
+            time.sleep(0.05)
+        else:
+            self._cleanup()
+            raise RuntimeError(
+                f"[ZED {serial}] open timed out after {open_timeout:.0f}s")
+        print(f"[ZED {serial}] opened (spawn process): {w}x{h} @ {int(fps)}fps")
+
+    def get(self):
+        """Return the latest left color_rgb_uint8 frame or None (non-blocking:
+        just a locked memcpy out of shared memory, no pyzed calls)."""
+        with self._lock:
+            if self._seq.value == 0:
+                return None
+            return self._buf.copy()
+
+    def _cleanup(self):
+        try:
+            self._stop_event.set()
+        except Exception:
+            pass
+        if self._proc is not None:
+            self._proc.join(timeout=2)
+            if self._proc.is_alive():
+                self._proc.terminate()
+                self._proc.join(timeout=2)
+            self._proc = None
+        if self._shm is not None:
+            try:
+                self._shm.close()
+            except Exception:
+                pass
+            try:
+                self._shm.unlink()
+            except Exception:
+                pass
+            self._shm = None
+
+    def stop(self):
+        self._cleanup()
 
 
 def find_video_device_by_usb_id(vendor_id: str, product_id: str):
@@ -258,19 +552,34 @@ class KeyboardTeleop:
         'u': 'rol_l', 'o': 'rol_r',
     }
 
-    def __init__(self, pos_speed=0.08, rot_speed=0.3, speed_mult=2.0):
+    def __init__(self, pos_speed=0.08, rot_speed=0.3):
         self.pos_speed = pos_speed
         self.rot_speed = rot_speed
-        self.speed_mult = float(speed_mult)
         self._states = {v: False for v in self.KEY_MAP.values()}
-        self.gripper_closing = False
-        self.gripper_opening = False
+        # One-shot gripper requests: set True on a genuine Z/X DOWN-edge and
+        # consumed (cleared) exactly once by the control loop. X11 key
+        # auto-repeat replays a synthetic release+press pair per repeat while a
+        # key is held, which naive press-edge detection would read as many
+        # presses. We reject any press that lands within _gripper_debounce of
+        # the last release of the same key, so one physical press = one request.
+        self.gripper_close_req = False
+        self.gripper_open_req = False
+        self._z_last_release = 0.0
+        self._x_last_release = 0.0
+        self._gripper_debounce = 0.05
+        self.shift_held = False
         self.quit_requested = False
         self.home_requested = False
         self.record_start = False
         self.record_stop = False
         self.record_drop = False
 
+        # Lazy pynput import (needs an X display at import time). Deferring it
+        # here keeps the module importable headlessly, which matters because the
+        # spawned ZED child processes re-import this module and must NOT require
+        # a display just to grab frames.
+        from pynput import keyboard as pynput_keyboard
+        self._pk = pynput_keyboard
         self._listener = pynput_keyboard.Listener(
             on_press=self._press, on_release=self._release)
         self._listener.start()
@@ -282,16 +591,18 @@ class KeyboardTeleop:
             return None
 
     def _press(self, key):
+        if key in (self._pk.Key.shift, self._pk.Key.shift_r):
+            self.shift_held = True
+            return
         c = self._char(key)
         if c in self.KEY_MAP:
             self._states[self.KEY_MAP[c]] = True
-        elif c is not None and c in '123456789':
-            self.speed_mult = float(c)
-            print(f"\n[Teleop] speed multiplier set to x{int(self.speed_mult)}")
         elif c == 'z':
-            self.gripper_closing = True
+            if time.monotonic() - self._z_last_release > self._gripper_debounce:
+                self.gripper_close_req = True
         elif c == 'x':
-            self.gripper_opening = True
+            if time.monotonic() - self._x_last_release > self._gripper_debounce:
+                self.gripper_open_req = True
         elif c == 'h':
             self.home_requested = True
         elif c == 'c':
@@ -300,20 +611,24 @@ class KeyboardTeleop:
             self.record_stop = True
         elif c == 'b':
             self.record_drop = True
-        if key == pynput_keyboard.Key.esc:
+        if key == self._pk.Key.esc:
             self.quit_requested = True
 
     def _release(self, key):
+        if key in (self._pk.Key.shift, self._pk.Key.shift_r):
+            self.shift_held = False
+            return
         c = self._char(key)
         if c in self.KEY_MAP:
             self._states[self.KEY_MAP[c]] = False
         elif c == 'z':
-            self.gripper_closing = False
+            self._z_last_release = time.monotonic()
         elif c == 'x':
-            self.gripper_opening = False
+            self._x_last_release = time.monotonic()
 
     def get_velocity(self, dt):
-        s, ps, rs = self._states, self.pos_speed * self.speed_mult, self.rot_speed * self.speed_mult
+        mult = 3.0 if self.shift_held else 1.0
+        s, ps, rs = self._states, self.pos_speed * mult, self.rot_speed * mult
         dp = np.zeros(3)
         if s['fwd']:   dp[0] += ps * dt
         if s['bwd']:   dp[0] -= ps * dt
@@ -452,6 +767,33 @@ def reset_to_home(robot: FrankaClient, frequency: int = CONTROL_FREQUENCY):
     print("[Home] Done.")
 
 
+def compose_camera_grid(vis_items, cell_w=480, cell_h=360, cols=2):
+    """Tile (label, rgb_image) pairs into a BGR grid (``cols`` columns,
+    ceil(n/cols) rows). Each image is letterboxed into a uniform cell (aspect
+    preserved, black bars fill the remainder) so hstack/vstack never misalign
+    on cameras of differing resolution; missing trailing slots are black. Draws
+    the per-camera label into each cell. Returns the montage or None."""
+    if not vis_items:
+        return None
+    cells = []
+    for label, rgb in vis_items:
+        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        h, w = bgr.shape[:2]
+        s = min(cell_w / float(w), cell_h / float(h))
+        nw, nh = max(1, int(round(w * s))), max(1, int(round(h * s)))
+        resized = cv2.resize(bgr, (nw, nh))
+        cell = np.zeros((cell_h, cell_w, 3), dtype=np.uint8)
+        y0, x0 = (cell_h - nh) // 2, (cell_w - nw) // 2
+        cell[y0:y0 + nh, x0:x0 + nw] = resized
+        cv2.putText(cell, label, (5, 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+        cells.append(cell)
+    while len(cells) % cols != 0:
+        cells.append(np.zeros((cell_h, cell_w, 3), dtype=np.uint8))
+    rows = [np.hstack(cells[i:i + cols]) for i in range(0, len(cells), cols)]
+    return np.vstack(rows)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Franka keyboard teleop + multi-camera data collection')
@@ -462,18 +804,25 @@ def main():
     parser.add_argument('--frequency', type=int, default=CONTROL_FREQUENCY)
     parser.add_argument('--pos_speed', type=float, default=POS_SPEED)
     parser.add_argument('--rot_speed', type=float, default=ROT_SPEED)
-    parser.add_argument('--speed_mult', type=float, default=3.0,
-                        help='Default runtime speed multiplier; press 1-9 during teleop to change it')
     parser.add_argument('--no_l515', action='store_true',
                         help='Disable L515 cameras')
     parser.add_argument('--no_fisheye', action='store_true',
                         help='Disable fisheye camera')
+    parser.add_argument('--no_zed', action='store_true',
+                        help='Disable ZED cameras')
     parser.add_argument('--no_depth', action='store_true',
                         help='Do not record depth images')
     parser.add_argument('--init_home', action='store_true', default=True)
     args = parser.parse_args()
 
     dt = 1.0 / args.frequency
+    # Send each pose command command_latency before the cycle boundary so the
+    # cadence stays steady regardless of how long the pre-command work took.
+    command_latency = 1.0 / 100.0
+    # Visualization (imshow/resize/grid) is expensive; cap it well below the
+    # control rate so drawing never gates the control loop.
+    vis_fps = 15.0
+    vis_interval = 1.0 / vis_fps
 
     # ---- Cameras ----
     l515_cams = []
@@ -498,13 +847,32 @@ def main():
         else:
             print(f"[Camera] Fisheye USB {FISHEYE_USB_ID} not found")
 
+    zed_cams = []
+    if not args.no_zed:
+        if ZED_SERIALS:
+            zed_serials = [int(s) for s in ZED_SERIALS]
+        else:
+            try:
+                zed_serials = detect_zed_serials()
+            except Exception as e:
+                zed_serials = []
+                print(f"[Camera] ZED enumeration failed: {e}")
+            if zed_serials:
+                print(f"[Camera] Auto-detected {len(zed_serials)} ZED(s): "
+                      f"{zed_serials}")
+            else:
+                print("[Camera] No ZED cameras detected; skipping ZED capture")
+        for serial in zed_serials:
+            try:
+                print(f"[Camera] Starting ZED {serial} ...")
+                zed_cams.append(ZEDCamera(
+                    serial, resolution=ZED_RESOLUTION, fps=ZED_FPS))
+            except Exception as e:
+                print(f"[Camera] ZED {serial} failed: {e}")
+
     # ---- Robot ----
     robot = FrankaClient(args.robot_ip, args.robot_port)
-    teleop = KeyboardTeleop(
-        pos_speed=args.pos_speed,
-        rot_speed=args.rot_speed,
-        speed_mult=args.speed_mult,
-    )
+    teleop = KeyboardTeleop(pos_speed=args.pos_speed, rot_speed=args.rot_speed)
     recorder = EpisodeRecorder(args.output)
 
     print("=" * 60)
@@ -512,12 +880,13 @@ def main():
     print(f"  Server:    {args.robot_ip}:{args.robot_port}")
     print(f"  L515:      {len(l515_cams)} cameras")
     print(f"  Fisheye:   {'yes' if fisheye_cam else 'no'}")
+    print(f"  ZED:       {len(zed_cams)} cameras")
     print(f"  Freq:      {args.frequency} Hz")
-    print(f"  Speed x:   {args.speed_mult:.1f} (press 1-9 to change)")
     print(f"  Output:    {args.output}")
     print("=" * 60)
     print("  C = start recording, V = stop & save, B = drop")
-    print("  WASD = move, 1-9 = speed, Z/X = gripper, H = home, Esc = quit")
+    print("  WASD = move, Z = close gripper, X = open gripper,")
+    print("  H = home, Esc = quit")
     print("=" * 60)
 
     try:
@@ -532,12 +901,23 @@ def main():
 
         is_recording = False
         last_print = 0.0
+        last_vis = 0.0
+        gripper_meas = gripper_pos
+
+        # Drift-free fixed-schedule loop: each cycle boundary is derived from a
+        # monotonic origin (t_start + i*dt) so a heavy iteration never
+        # accumulates drift, and the pose command is sent at a steady phase
+        # (t_cycle_end - command_latency) decoupled from camera / vis work.
+        t_start = time.monotonic()
+        iter_idx = 0
 
         while not teleop.quit_requested:
-            t0 = time.monotonic()
+            t_cycle_end = t_start + (iter_idx + 1) * dt
+            t_sample = t_cycle_end - command_latency
             ts = time.time()
 
             # ---- events ----
+            did_block = False
             if teleop.record_start and not is_recording:
                 teleop.record_start = False
                 is_recording = True
@@ -548,6 +928,7 @@ def main():
                 is_recording = False
                 if not recorder.is_empty:
                     recorder.save()
+                    did_block = True
                 print(">>> RECORDING STOPPED")
             if teleop.record_drop:
                 teleop.record_drop = False
@@ -560,6 +941,71 @@ def main():
                 reset_to_home(robot, args.frequency)
                 target_pose = robot.get_tip_pose()
                 gripper_pos = MAX_GRIPPER_WIDTH
+                did_block = True
+
+            # A blocking event (episode save / homing) ran the wall clock far
+            # past the current schedule; re-anchor the origin so the loop does
+            # not fire a burst of catch-up pose commands.
+            if did_block:
+                t_start = time.monotonic()
+                iter_idx = 0
+                continue
+
+            # ---- cameras (non-blocking cached reads) ----
+            # Only touch the camera buffers when a frame is needed this tick
+            # (recording, or a throttled vis tick); the expensive compositing is
+            # deferred to compose_camera_grid and gated by vis_interval so
+            # drawing never gates the control cadence.
+            now_m = time.monotonic()
+            need_vis = (now_m - last_vis) >= vis_interval
+            cam_frames = {}
+            vis_items = []
+            if is_recording or need_vis:
+                for i, cam in enumerate(l515_cams):
+                    color, depth = cam.get()
+                    if color is not None:
+                        cam_frames[f'l515_{i}'] = {
+                            'color': color,
+                            'depth': depth if not args.no_depth else None,
+                        }
+                        if need_vis:
+                            vis_items.append((f'L515-{i}', color))
+                if fisheye_cam is not None:
+                    color = fisheye_cam.get()
+                    if color is not None:
+                        cam_frames['fisheye'] = {'color': color, 'depth': None}
+                        if need_vis:
+                            vis_items.append(('Fisheye', color))
+                for i, cam in enumerate(zed_cams):
+                    color = cam.get()
+                    if color is not None:
+                        cam_frames[f'zed_{i}'] = {'color': color, 'depth': None}
+                        if need_vis:
+                            vis_items.append((f'ZED-{i}', color))
+
+            # ---- visualize (throttled to ~vis_fps, off the control cadence) --
+            if need_vis and vis_items:
+                canvas = compose_camera_grid(vis_items)
+                if canvas is not None:
+                    mh = canvas.shape[0]
+                    rec_color = (0, 0, 255) if is_recording else (200, 200, 200)
+                    label = f'Ep {recorder._ep_idx}'
+                    if is_recording:
+                        label += f' [REC {len(recorder.timestamps)} frames]'
+                    cv2.putText(canvas, label, (10, mh - 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, rec_color, 2)
+                    pos_txt = (f'pos=[{target_pose[0]:.3f},{target_pose[1]:.3f},'
+                               f'{target_pose[2]:.3f}]  gripper={gripper_meas:.3f}m '
+                               f'(cmd {gripper_pos:.3f})')
+                    cv2.putText(canvas, pos_txt, (10, mh - 8),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+                    cv2.imshow('Franka Collect', canvas)
+                    if cv2.waitKey(1) == 27:
+                        break
+                last_vis = now_m
+
+            # ---- wait for the scheduled command phase, then command the arm ---
+            precise_wait(t_sample)
 
             # ---- teleop ----
             dpos, drot_xyz = teleop.get_velocity(dt)
@@ -568,46 +1014,34 @@ def main():
             target_pose[3:] = (drot * st.Rotation.from_rotvec(target_pose[3:])).as_rotvec()
             robot.update_desired_ee_pose(target_pose)
 
-            # ---- gripper ----
-            if teleop.gripper_closing and gripper_pos > 0.01:
-                robot.gripper_grasp()
+            # ---- gripper: full close / open, one dispatch per Z/X press edge -
+            # Z = full force-close (grasp), X = full open (release). The DOWN-edge
+            # is detected in KeyboardTeleop (auto-repeat debounced) and delivered
+            # as a one-shot request, so a single press fires exactly one motion.
+            # Dispatch is async (fire-and-forget) so the blocking gripper RPC
+            # never stalls the pose loop; gripper_pos is a pure input-driven cmd,
+            # feedback never writes it. Print only on an actual target change.
+            if teleop.gripper_close_req:
+                teleop.gripper_close_req = False
+                _async_gripper_cmd(args.robot_ip, args.robot_port, 'grasp',
+                                   speed=GRIPPER_SPEED, force=40.0)
+                if gripper_pos != 0.0:
+                    print("\n[GRIPPER] full force-close dispatched")
                 gripper_pos = 0.0
-            elif teleop.gripper_opening and gripper_pos < 0.07:
-                robot.gripper_release()
+            elif teleop.gripper_open_req:
+                teleop.gripper_open_req = False
+                _async_gripper_cmd(args.robot_ip, args.robot_port, 'release',
+                                   speed=GRIPPER_SPEED)
+                if gripper_pos != MAX_GRIPPER_WIDTH:
+                    print("\n[GRIPPER] full open dispatched")
                 gripper_pos = MAX_GRIPPER_WIDTH
 
-            # ---- cameras ----
-            cam_frames = {}
-            vis_imgs = []
-            target_h = 320
-
-            for i, cam in enumerate(l515_cams):
-                color, depth = cam.get()
-                if color is not None:
-                    cam_frames[f'l515_{i}'] = {
-                        'color': color,
-                        'depth': depth if not args.no_depth else None,
-                    }
-                    # build vis image
-                    bgr = cv2.cvtColor(color, cv2.COLOR_RGB2BGR)
-                    h, w = bgr.shape[:2]
-                    scale = target_h / h
-                    bgr = cv2.resize(bgr, (int(w * scale), target_h))
-                    cv2.putText(bgr, f'L515-{i}', (5, 18),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-                    vis_imgs.append(bgr)
-
-            if fisheye_cam is not None:
-                color = fisheye_cam.get()
-                if color is not None:
-                    cam_frames['fisheye'] = {'color': color, 'depth': None}
-                    bgr = cv2.cvtColor(color, cv2.COLOR_RGB2BGR)
-                    h, w = bgr.shape[:2]
-                    scale = target_h / h
-                    bgr = cv2.resize(bgr, (int(w * scale), target_h))
-                    cv2.putText(bgr, 'Fisheye', (5, 18),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-                    vis_imgs.append(bgr)
+            # REAL measured gripper width (server-side poller makes this a
+            # non-blocking cached read); fall back to commanded on any error.
+            try:
+                gripper_meas = float(robot.get_gripper_state().get('width', gripper_pos))
+            except Exception:
+                gripper_meas = gripper_pos
 
             # ---- record ----
             if is_recording and cam_frames:
@@ -616,31 +1050,11 @@ def main():
                 action[6] = gripper_pos
 
                 joints = robot.get_joint_positions()
-                gripper_w = gripper_pos
                 robot_state = np.zeros(7)
                 robot_state[:6] = robot.get_tip_pose()
-                robot_state[6] = gripper_w
+                robot_state[6] = gripper_meas
 
                 recorder.add(ts, action, robot_state, joints, cam_frames)
-
-            # ---- visualize ----
-            if vis_imgs:
-                canvas = np.hstack(vis_imgs)
-                rec_color = (0, 0, 255) if is_recording else (200, 200, 200)
-                label = f'Ep {recorder._ep_idx}'
-                if is_recording:
-                    label += f' [REC {len(recorder.timestamps)} frames]'
-                cv2.putText(canvas, label, (10, target_h - 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, rec_color, 2)
-
-                pos_txt = (f'pos=[{target_pose[0]:.3f},{target_pose[1]:.3f},'
-                           f'{target_pose[2]:.3f}]  gripper={gripper_pos:.3f}m')
-                cv2.putText(canvas, pos_txt, (10, target_h - 8),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-
-                cv2.imshow('Franka Collect', canvas)
-                if cv2.waitKey(1) == 27:
-                    break
 
             # ---- terminal print (2 Hz) ----
             now = time.monotonic()
@@ -648,13 +1062,13 @@ def main():
                 p = target_pose
                 rec_flag = ' [REC]' if is_recording else ''
                 print(f"\rpos=[{p[0]:.3f},{p[1]:.3f},{p[2]:.3f}]  "
-                      f"gripper={gripper_pos:.3f}m{rec_flag}   ", end='', flush=True)
+                      f"gripper={gripper_meas:.3f}m (cmd {gripper_pos:.3f}){rec_flag}   ",
+                      end='', flush=True)
                 last_print = now
 
-            # ---- frequency regulation ----
-            elapsed = time.monotonic() - t0
-            if elapsed < dt:
-                time.sleep(dt - elapsed)
+            # ---- frequency regulation (drift-free fixed schedule) ----
+            precise_wait(t_cycle_end)
+            iter_idx += 1
 
     except KeyboardInterrupt:
         pass
@@ -671,6 +1085,8 @@ def main():
             cam.stop()
         if fisheye_cam:
             fisheye_cam.stop()
+        for cam in zed_cams:
+            cam.stop()
 
         try:
             robot.terminate_current_policy()
