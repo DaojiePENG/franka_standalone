@@ -9,6 +9,7 @@
 # Usage:
 #   bash launch_server.sh                           # defaults
 #   TASK=press_three_buttons bash launch_server.sh  # override task
+#   TASK=move_objects_into_box bash launch_server.sh  # override task
 # ──────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -30,7 +31,7 @@ echo "[launch_server] conda env: $CONDA_ENV ($(python --version 2>&1))"
 
 # ── Configurable variables (override via environment) ─────────────────────────
 ASSET_ROOT="${ASSET_ROOT:-/home/aihub/daojie/LeapBot-inference-asset}"
-TASK="${TASK:-move_objects_into_box}"
+TASK="${TASK:-press_three_buttons}"
 INFER_ROOT="${INFER_ROOT:-/home/aihub/daojie/LeapBot-inference-only}"
 DEVICE="${DEVICE:-cuda:0}"
 BACKEND="${BACKEND:-tensorrt}"

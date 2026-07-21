@@ -110,16 +110,20 @@ FRANKA_HOME_JOINTS = np.array([0, -0.785, 0, -2.356, 0, 1.571, 0.785])
 | zed_1   | 可视化 | `--cam_vis zed_1,l515_0` |
 | l515_0  | 可视化（含深度） | `--cam_vis zed_1,l515_0` |
 
-**切换相机示例**：
+**已预置的配置文件**（按任务区分相机）：
+
+| 配置文件 | 任务 | global_image | wrist_image |
+|---------|------|-------------|-------------|
+| `config_move_objects_into_box.py` | move_objects_into_box | zed_0（左侧） | fisheye |
+| `config_press_three_buttons.py` | press_three_buttons | zed_1（正前方） | fisheye |
 
 ```bash
-# 实验 A：用 zed_0 做全局视角，fisheye 做手腕视角（默认）
---cam_global zed_0 --cam_wrist fisheye
+# 直接使用预置配置
+python leapbot_control.py --config config_move_objects_into_box.py
+python leapbot_control.py --config config_press_three_buttons.py
 
-# 实验 B：用 zed_1 做全局视角，l515_0 做手腕视角
+# CLI 临时覆盖
 --cam_global zed_1 --cam_wrist l515_0
-
-# 实验 C：只用两个 ZED，不用 fisheye 和 L515
 --cam_global zed_0 --cam_wrist zed_1 --no_fisheye --no_l515
 ```
 
@@ -397,6 +401,48 @@ CONFIG_FILE=exp_A_config.py SERVER_IP=<IP> bash launch_leapbot.sh
 SERVER_IP=<IP> --cam_global zed_1 --cam_wrist l515_0 bash launch_leapbot.sh
 ```
 
+### Mock 推理测试（不连接机器人）
+
+在实际控制机器人之前，用 Mock 模式验证推理是否正常工作：
+
+```bash
+# 方式 A：CLI 传入 --mock
+python leapbot_control.py --config config_move_objects_into_box.py --mock
+
+# 方式 B：在配置文件中设置 MOCK = True
+# leapbot_config.py:
+MOCK = True
+python leapbot_control.py
+```
+
+Mock 模式行为：
+- ✅ 采集所有相机画面（与真实模式完全一致）
+- ✅ 连接 GPU 推理服务器，发送推理请求
+- ✅ 可视化相机画面窗口
+- ❌ **不连接** Franka 机器人
+- ❌ **不执行** 任何动作（只打印预测结果）
+
+按 **S** 启动策略后，终端输出每次推理的预测动作：
+
+```
+[Mock] Inference 52.3ms, chunk shape=(32, 7), showing 4 steps:
+       step      dx      dy      dz     drx     dry     drz   grip  target_x target_y target_z
+          0  +0.0012 -0.0003 +0.0008 +0.0010 -0.0005 +0.0002  0.080  +0.4012 -0.0003 +0.3008
+          1  +0.0015 -0.0002 +0.0010 +0.0008 -0.0004 +0.0003  0.080  +0.4027 -0.0005 +0.3018
+          2  +0.0018 -0.0001 +0.0012 +0.0006 -0.0003 +0.0004  0.080  +0.4045 -0.0006 +0.3030
+          3  +0.0020 +0.0000 +0.0015 +0.0005 -0.0002 +0.0005  0.080  +0.4065 -0.0006 +0.3045
+```
+
+检查要点：
+1. **相机画面**：global_image 和 wrist_image 是否正确对应
+2. **推理延迟**：infer 时间是否合理（<100ms 为佳）
+3. **动作幅度**：dx/dy/dz 是否在合理范围（不应出现 >0.05 的突变）
+4. **动作方向**：delta 方向是否符合预期（如抓取任务应向下移动）
+5. **安全检查**：UNSAFE 标记表示动作超出安全边界，需要调整
+6. **夹爪值**：grip 列是否在 0~0.08 范围内
+
+验证合理后再进入阶段 1（标定）和后续的真实机器人实验。
+
 ---
 
 ## 6. 配置参数速查
@@ -499,14 +545,16 @@ print(result["action_chunk"].shape)  # (32, 7)
 
 ```
 franka_standalone/leapbot/
-├── README.md               # 本文档
-├── leapbot_config.py       # 控制器配置文件（实验前必改）
-├── server.py               # GPU 推理服务器（FastAPI）
-├── launch_server.sh        # GPU 服务器启动脚本（conda vj_fw）
-├── leapbot_client.py       # NUC 侧推理 HTTP 客户端
-├── leapbot_control.py      # NUC 侧闭环控制主脚本（完整键盘控制）
-├── launch_leapbot.sh       # NUC 侧启动脚本（franka_server + 控制器）
-└── calibrate_workspace.py  # 工作空间标定工具（实验前必用）
+├── README.md                             # 本文档
+├── leapbot_config.py                     # 默认控制器配置
+├── config_move_objects_into_box.py       # 任务配置：zed_0 + fisheye
+├── config_press_three_buttons.py         # 任务配置：zed_1 + fisheye
+├── server.py                             # GPU 推理服务器（FastAPI）
+├── launch_server.sh                      # GPU 服务器启动脚本（conda vj_fw）
+├── leapbot_client.py                     # NUC 侧推理 HTTP 客户端
+├── leapbot_control.py                    # NUC 侧闭环控制（支持 --mock）
+├── launch_leapbot.sh                     # NUC 侧启动脚本
+└── calibrate_workspace.py                # 工作空间标定工具
 ```
 
 ---

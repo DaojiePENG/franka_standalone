@@ -383,6 +383,7 @@ class LeapbotController:
         self.dt = 1.0 / args.frequency
         self.task = args.task
         self.action_horizon = args.action_horizon
+        self.mock = getattr(args, 'mock', False)
 
         # Camera → model view mapping (resolved at camera init time)
         self.cam_global = args.cam_global    # e.g. "zed_0"
@@ -399,8 +400,12 @@ class LeapbotController:
         self.cameras = {}   # {name: camera_object}
         self._init_cameras()
 
-        # ── Robot ─────────────────────────────────────────────────────────────
-        self.robot = FrankaClient(args.robot_ip, args.robot_port)
+        # ── Robot (skip in mock mode) ─────────────────────────────────────────
+        if self.mock:
+            print("[Mock] Skipping robot connection")
+            self.robot = None
+        else:
+            self.robot = FrankaClient(args.robot_ip, args.robot_port)
 
         # ── Inference client ──────────────────────────────────────────────────
         self.leapbot = LeapbotClient(args.server_ip, args.server_port,
@@ -573,6 +578,7 @@ class LeapbotController:
     def _dispatch_keyboard(self, robot, current_tip):
         """Read all keyboard flags and update state / issue commands."""
         kb = self.kb
+        is_mock = self.mock
 
         # ── Emergency stop (highest priority, always checked) ─────────────────
         if kb.emergency_stop:
@@ -580,16 +586,16 @@ class LeapbotController:
             if self.state != PolicyState.STOPPED:
                 print("\n[EMERGENCY STOP] Policy halted, opening gripper")
                 self.state = PolicyState.STOPPED
-                _async_gripper_cmd(self.args.robot_ip, self.args.robot_port,
-                                   'release', speed=GRIPPER_SPEED)
+                if not is_mock:
+                    _async_gripper_cmd(self.args.robot_ip, self.args.robot_port,
+                                       'release', speed=GRIPPER_SPEED)
+                    try:
+                        robot.terminate_current_policy()
+                    except Exception:
+                        pass
+                    robot.start_cartesian_impedance()
+                    robot.update_desired_ee_pose(current_tip)
                 self.gripper_width = MAX_GRIPPER_WIDTH
-                try:
-                    robot.terminate_current_policy()
-                except Exception:
-                    pass
-                # Re-start impedance so the arm holds position
-                robot.start_cartesian_impedance()
-                robot.update_desired_ee_pose(current_tip)
             return True  # signal that state changed
 
         # ── Quit ──────────────────────────────────────────────────────────────
@@ -630,30 +636,36 @@ class LeapbotController:
                 self._single_step_pending = True
                 print("\n[Step] executing one action ...")
 
-        # ── Home ──────────────────────────────────────────────────────────────
+        # ── Home (skip in mock mode) ──────────────────────────────────────────
         if kb.home_requested:
             kb.home_requested = False
-            if self.state in (PolicyState.IDLE, PolicyState.PAUSED,
-                              PolicyState.STOPPED):
+            if is_mock:
+                print("\n[Home] skipped (mock mode)")
+            elif self.state in (PolicyState.IDLE, PolicyState.PAUSED,
+                                PolicyState.STOPPED):
                 print("\n[Home] resetting ...")
                 reset_to_home(robot, self.args.frequency)
                 self.state = PolicyState.IDLE
                 self.gripper_width = MAX_GRIPPER_WIDTH
                 return 'home'  # signal to re-read pose
 
-        # ── Gripper (manual, one-shot) ────────────────────────────────────────
-        if kb.gripper_close_held:
+        # ── Gripper (skip in mock mode) ───────────────────────────────────────
+        if not is_mock:
+            if kb.gripper_close_held:
+                kb.gripper_close_held = False
+                _async_gripper_cmd(self.args.robot_ip, self.args.robot_port,
+                                   'grasp', speed=GRIPPER_SPEED, force=40.0)
+                self.gripper_width = 0.0
+                print("\n[Gripper] close")
+            elif kb.gripper_open_held:
+                kb.gripper_open_held = False
+                _async_gripper_cmd(self.args.robot_ip, self.args.robot_port,
+                                   'release', speed=GRIPPER_SPEED)
+                self.gripper_width = MAX_GRIPPER_WIDTH
+                print("\n[Gripper] open")
+        else:
             kb.gripper_close_held = False
-            _async_gripper_cmd(self.args.robot_ip, self.args.robot_port,
-                               'grasp', speed=GRIPPER_SPEED, force=40.0)
-            self.gripper_width = 0.0
-            print("\n[Gripper] close")
-        elif kb.gripper_open_held:
             kb.gripper_open_held = False
-            _async_gripper_cmd(self.args.robot_ip, self.args.robot_port,
-                               'release', speed=GRIPPER_SPEED)
-            self.gripper_width = MAX_GRIPPER_WIDTH
-            print("\n[Gripper] open")
 
         # ── Horizon adjust ────────────────────────────────────────────────────
         if kb.horizon_increase:
@@ -691,10 +703,13 @@ class LeapbotController:
         args = self.args
         robot = self.robot
         leapbot = self.leapbot
+        is_mock = self.mock
 
         # ── Pre-flight ────────────────────────────────────────────────────────
+        mode_str = "MOCK (inference only, no robot)" if is_mock \
+                   else "Real-Robot Controller"
         print("\n" + "=" * 60)
-        print("  LeapBot Real-Robot Controller")
+        print(f"  LeapBot {mode_str}")
         print("=" * 60)
         print("[Pre-flight] Checking GPU inference server ...")
         if not leapbot.ready():
@@ -703,22 +718,31 @@ class LeapbotController:
             return
         print("[Pre-flight] GPU server ready ✓")
 
-        print("[Pre-flight] Connecting to Franka ...")
-        robot.start_cartesian_impedance()
-        print("[Pre-flight] Franka connected ✓")
+        if is_mock:
+            # Mock mode: use home pose as fake proprio
+            current_tip = EE_HOME_POSE.copy()
+            self.gripper_width = MAX_GRIPPER_WIDTH
+            print("[Pre-flight] Mock mode — using home pose as fake proprio")
+        else:
+            print("[Pre-flight] Connecting to Franka ...")
+            robot.start_cartesian_impedance()
+            print("[Pre-flight] Franka connected ✓")
 
-        # ── Home ──────────────────────────────────────────────────────────────
-        if not args.skip_home:
-            reset_to_home(robot, args.frequency)
+            # ── Home ──────────────────────────────────────────────────────────
+            if not args.skip_home:
+                reset_to_home(robot, args.frequency)
 
-        current_tip = robot.get_tip_pose()
-        self.gripper_width = MAX_GRIPPER_WIDTH
-        robot.gripper_release()
-        time.sleep(0.5)
+            current_tip = robot.get_tip_pose()
+            self.gripper_width = MAX_GRIPPER_WIDTH
+            robot.gripper_release()
+            time.sleep(0.5)
 
         # ── Banner ────────────────────────────────────────────────────────────
         print("\n" + "=" * 60)
-        print("  Franka server  : {}:{}".format(args.robot_ip, args.robot_port))
+        if is_mock:
+            print("  Mode           : MOCK (inference only)")
+        else:
+            print("  Franka server  : {}:{}".format(args.robot_ip, args.robot_port))
         print("  GPU server     : {}:{}".format(args.server_ip, args.server_port))
         print("  Task           : {}".format(self.task))
         print("  Frequency      : {} Hz".format(args.frequency))
@@ -730,15 +754,16 @@ class LeapbotController:
         print("  Controls:")
         print("    S        Start / resume policy")
         print("    Space    Pause / resume toggle")
-        print("    B        Stop policy → IDLE (hold pose)")
+        print("    B        Stop policy → IDLE")
         print("    N / →    Single-step one action")
-        print("    Esc      Emergency stop (stop + open gripper)")
-        print("    H        Reset to home (only when paused/idle/stopped)")
-        print("    Z / X    Close / open gripper (manual)")
+        print("    Esc      Emergency stop")
+        if not is_mock:
+            print("    H        Reset to home")
+            print("    Z / X    Close / open gripper")
         print("    + / -    Increase / decrease action horizon")
         print("    V        Toggle camera visualization")
         print("    M        Print current state")
-        print("    Q        Quit gracefully")
+        print("    Q        Quit")
         print("=" * 60)
         print(f"\n  State: {self.state.value}  —  press S to start\n")
 
@@ -754,16 +779,18 @@ class LeapbotController:
             while True:
                 t_cycle_end = t_start + (iter_idx + 1) * self.dt
 
-                # ── 1. Read robot state ───────────────────────────────────────
-                try:
-                    current_tip = robot.get_tip_pose()
-                except Exception:
-                    pass
-                try:
-                    gs = robot.get_gripper_state()
-                    self.gripper_width = float(gs.get('width', self.gripper_width))
-                except Exception:
-                    pass
+                # ── 1. Read robot state (skip in mock) ────────────────────────
+                if not is_mock:
+                    try:
+                        current_tip = robot.get_tip_pose()
+                    except Exception:
+                        pass
+                    try:
+                        gs = robot.get_gripper_state()
+                        self.gripper_width = float(gs.get('width',
+                                                          self.gripper_width))
+                    except Exception:
+                        pass
 
                 # ── 2. Cameras (always read for vis, even if paused) ──────────
                 cam_frames = self._get_frames()
@@ -773,7 +800,8 @@ class LeapbotController:
                 if result is False:
                     break   # quit requested
                 if result == 'home':
-                    current_tip = robot.get_tip_pose()
+                    if not is_mock:
+                        current_tip = robot.get_tip_pose()
                     t_start = time.monotonic()
                     iter_idx = 0
                     continue
@@ -788,7 +816,6 @@ class LeapbotController:
                 should_infer = (self.state == PolicyState.AUTO)
 
                 if should_infer:
-                    # Get model-input frames
                     global_img = cam_frames.get(self.cam_global)
                     wrist_img  = cam_frames.get(self.cam_wrist)
 
@@ -809,10 +836,15 @@ class LeapbotController:
                             action_chunk = result["action_chunk"]
                             infer_ms = result["latency_ms"]
 
-                            n_exec = min(self.action_horizon,
-                                         action_chunk.shape[0])
-                            actions_done = self._execute_horizon(
-                                robot, action_chunk, n_exec, current_tip)
+                            if is_mock:
+                                # Mock: print predicted actions, don't execute
+                                self._print_mock_actions(
+                                    action_chunk, current_tip, infer_ms)
+                            else:
+                                n_exec = min(self.action_horizon,
+                                             action_chunk.shape[0])
+                                self._execute_horizon(
+                                    robot, action_chunk, n_exec, current_tip)
 
                             # After single-step, auto-pause
                             if self._single_step_pending:
@@ -846,11 +878,12 @@ class LeapbotController:
             print("\n\nShutting down ...")
             self.kb.stop()
             cv2.destroyAllWindows()
-            try:
-                robot.terminate_current_policy()
-            except Exception:
-                pass
-            robot.close()
+            if not is_mock:
+                try:
+                    robot.terminate_current_policy()
+                except Exception:
+                    pass
+                robot.close()
             self._stop_cameras()
             leapbot.close()
             print("Done.")
@@ -862,6 +895,33 @@ class LeapbotController:
         proprio[:6] = tip_pose
         proprio[6] = self.gripper_width
         return proprio
+
+    def _print_mock_actions(self, action_chunk, current_tip, infer_ms):
+        """Mock mode: print predicted actions and simulated targets."""
+        n = min(self.action_horizon, action_chunk.shape[0])
+        tip = current_tip.copy()
+        print(f"\n[Mock] Inference {infer_ms:.1f}ms, "
+              f"chunk shape={action_chunk.shape}, showing {n} steps:")
+        print(f"       {'step':>4s}  "
+              f"{'dx':>7s} {'dy':>7s} {'dz':>7s} "
+              f"{'drx':>7s} {'dry':>7s} {'drz':>7s} "
+              f"{'grip':>6s}  "
+              f"{'target_x':>8s} {'target_y':>8s} {'target_z':>8s}")
+        for i in range(n):
+            a = action_chunk[i]
+            if not np.isfinite(a).all():
+                print(f"       {i:4d}  NON-FINITE — stopping")
+                break
+            target = apply_delta_action(tip, a)
+            is_safe, violations = self.safety.check(tip, target)
+            safe_str = "" if is_safe else f"  UNSAFE({'; '.join(violations[:2])})"
+            print(f"       {i:4d}  "
+                  f"{a[0]:+7.4f} {a[1]:+7.4f} {a[2]:+7.4f} "
+                  f"{a[3]:+7.4f} {a[4]:+7.4f} {a[5]:+7.4f} "
+                  f"{a[6]:6.3f}  "
+                  f"{target[0]:+8.4f} {target[1]:+8.4f} {target[2]:+8.4f}"
+                  f"{safe_str}")
+            tip = target
 
     def _execute_horizon(self, robot, action_chunk, n_exec, current_tip):
         """Execute up to n_exec actions from the chunk with safety checks."""
@@ -992,6 +1052,11 @@ Config file: --config  (default: ./leapbot_config.py)
     parser.add_argument("--max_delta_rot", type=float, default=None)
     parser.add_argument("--skip_home", action="store_true", default=None)
 
+    # ── Mock mode ─────────────────────────────────────────────────────────────
+    parser.add_argument("--mock", action="store_true", default=None,
+                        help="Mock mode: cameras + inference only, "
+                             "no robot connection")
+
     # ── Workspace bounds ──────────────────────────────────────────────────────
     parser.add_argument("--safety_x_min", type=float, default=None)
     parser.add_argument("--safety_x_max", type=float, default=None)
@@ -1043,11 +1108,12 @@ Config file: --config  (default: ./leapbot_config.py)
     args.safety_z_min  = _get(args.safety_z_min,   "SAFETY_Z_MIN", 0.05)
     args.safety_z_max  = _get(args.safety_z_max,   "SAFETY_Z_MAX", 0.60)
 
-    # Boolean disable flags: store_true with None default means the CLI flag
+    # Boolean flags: store_true with None default means the CLI flag
     # was NOT given.  Fall back to config, then False.
     args.no_l515    = args.no_l515    or _cfg(cfg, "NO_L515",    False)
     args.no_fisheye = args.no_fisheye or _cfg(cfg, "NO_FISHEYE", False)
     args.no_zed     = args.no_zed     or _cfg(cfg, "NO_ZED",     False)
+    args.mock       = args.mock       or _cfg(cfg, "MOCK",       False)
 
     # ── Validate required ─────────────────────────────────────────────────────
     if args.server_ip is None:
