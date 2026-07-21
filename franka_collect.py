@@ -401,7 +401,10 @@ def _zed_worker(serial, resolution, fps, shm_name, shape, lock, seq, status,
             if cam.grab(runtime) != sl.ERROR_CODE.SUCCESS:
                 continue
             cam.retrieve_image(left_mat, sl.VIEW.LEFT)
-            arr = np.asarray(left_mat.get_data())
+            # pyzed 4.2 get_data() may return a ctypes pointer/array rather
+            # than a proper ndarray; np.ascontiguousarray forces a contiguous
+            # uint8 numpy array that OpenCV 5.x accepts.
+            arr = np.ascontiguousarray(np.asarray(left_mat.get_data()), dtype=np.uint8)
             if arr.ndim == 3 and arr.shape[2] == 4:
                 rgb = cv2.cvtColor(arr, cv2.COLOR_BGRA2RGB)
             else:
@@ -790,6 +793,8 @@ def compose_camera_grid(vis_items, cell_w=480, cell_h=360, cols=2):
         return None
     cells = []
     for label, rgb in vis_items:
+        # Ensure contiguous uint8 ndarray — OpenCV 5.x rejects anything else.
+        rgb = np.ascontiguousarray(rgb, dtype=np.uint8)
         bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
         h, w = bgr.shape[:2]
         s = min(cell_w / float(w), cell_h / float(h))

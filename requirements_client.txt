@@ -1,8 +1,17 @@
 # Workstation 上位机 (franka_control.py / franka_collect.py)
-zerorpc
-numpy
-scipy
-pynput
-opencv-python
+#
+# IMPORTANT: pyzed 4.2 requires numpy<2. scipy>=1.14 requires numpy>=2,
+# so scipy must stay <1.14 when pyzed is installed.
+# opencv-python 4.13+ also requires numpy>=2, so use <4.11.
+#
+# pyzed: install via /usr/local/zed/get_python_api.py (needs ZED SDK 4.2
+#         and libjpeg-turbo: conda install libjpeg-turbo)
+
+zerorpc==0.6.3
+numpy==1.26.4           # pyzed 4.2 requires <2
+scipy==1.13.1           # 1.14+ requires numpy>=2, incompatible with pyzed
+opencv-python==4.10.0.84  # 4.13+ requires numpy>=2; 5.x C-ext broken with numpy 1.x
+pynput==1.8.2
 matplotlib
 pyrealsense2==2.54.2.5684
+# pyzed==4.2           # installed via get_python_api.py, not pip

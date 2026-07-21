@@ -97,8 +97,8 @@ class PolicyKeyboardController:
     """
 
     def __init__(self):
-        from pynput import keyboard as pk
-        self._pk = pk
+        self._pk = None
+        self._listener = None
 
         # ── Policy control (one-shot flags) ───────────────────────────────────
         self.policy_start   = False   # S: start / resume
@@ -125,9 +125,15 @@ class PolicyKeyboardController:
         # ── Live state ────────────────────────────────────────────────────────
         self.shift_held = False
 
-        self._listener = pk.Listener(on_press=self._on_press,
-                                     on_release=self._on_release)
-        self._listener.start()
+        try:
+            from pynput import keyboard as pk
+            self._pk = pk
+            self._listener = pk.Listener(on_press=self._on_press,
+                                         on_release=self._on_release)
+            self._listener.start()
+        except ImportError as e:
+            print(f"[Keyboard] pynput unavailable ({e}) — keyboard input disabled")
+            print("[Keyboard] Use Ctrl+C to quit, or set DISPLAY for interactive control")
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
@@ -197,7 +203,8 @@ class PolicyKeyboardController:
             self._x_last_release = time.monotonic()
 
     def stop(self):
-        self._listener.stop()
+        if self._listener is not None:
+            self._listener.stop()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
