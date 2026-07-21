@@ -13,6 +13,7 @@ ZEDCamera and _zed_worker.
 Usage:
     python franka_collect.py -o ./data
     python franka_collect.py -o ./data --robot_ip 192.168.3.2
+    python franka_collect.py -o ./data --no_zed --no_depth
 
 Controls:
     W/S   Forward / Backward  (X)
@@ -22,13 +23,20 @@ Controls:
     I/K   Pitch up / down
     U/O   Roll left / right
     Shift Hold for 3x speed
-    Z     Close gripper (full)
-    X     Open gripper (full)
+    Z     Close gripper  (binary: full close / continuous: hold to step)
+    X     Open gripper   (binary: full open  / continuous: hold to step)
+    M     Toggle gripper mode  (default: binary, switch to continuous)
     C     Start recording episode
     V     Stop recording & save episode
     B     Drop (discard) current episode
     H     Reset to home
     Esc   Quit
+
+Gripper modes:
+    Binary (default)  One Z/X press fires a full close/open motion.
+    Continuous        Hold Z/X to step the gripper at GRIPPER_SPEED;
+                      release to stop at the current position.
+    Press M at any time to switch between modes (shown in terminal & overlay).
 """
 import argparse
 import time
@@ -556,17 +564,18 @@ class KeyboardTeleop:
         self.pos_speed = pos_speed
         self.rot_speed = rot_speed
         self._states = {v: False for v in self.KEY_MAP.values()}
-        # One-shot gripper requests: set True on a genuine Z/X DOWN-edge and
-        # consumed (cleared) exactly once by the control loop. X11 key
-        # auto-repeat replays a synthetic release+press pair per repeat while a
-        # key is held, which naive press-edge detection would read as many
-        # presses. We reject any press that lands within _gripper_debounce of
-        # the last release of the same key, so one physical press = one request.
-        self.gripper_close_req = False
-        self.gripper_open_req = False
+        # Gripper hold states: True while Z/X is physically held down.
+        # Auto-repeat (X11 synthetic release+press) is handled by debouncing
+        # the release edge so a held key stays "active" across repeats.
+        self.gripper_close_held = False
+        self.gripper_open_held = False
         self._z_last_release = 0.0
         self._x_last_release = 0.0
-        self._gripper_debounce = 0.05
+        self._gripper_debounce = 0.15
+        # Gripper control mode: False = binary (一键全开/全关, default),
+        # True = continuous (按住步进). Press M to toggle at runtime.
+        self.gripper_continuous = False
+        self.toggle_gripper_mode = False
         self.shift_held = False
         self.quit_requested = False
         self.home_requested = False
@@ -599,10 +608,10 @@ class KeyboardTeleop:
             self._states[self.KEY_MAP[c]] = True
         elif c == 'z':
             if time.monotonic() - self._z_last_release > self._gripper_debounce:
-                self.gripper_close_req = True
+                self.gripper_close_held = True
         elif c == 'x':
             if time.monotonic() - self._x_last_release > self._gripper_debounce:
-                self.gripper_open_req = True
+                self.gripper_open_held = True
         elif c == 'h':
             self.home_requested = True
         elif c == 'c':
@@ -611,6 +620,8 @@ class KeyboardTeleop:
             self.record_stop = True
         elif c == 'b':
             self.record_drop = True
+        elif c == 'm':
+            self.toggle_gripper_mode = True
         if key == self._pk.Key.esc:
             self.quit_requested = True
 
@@ -622,8 +633,10 @@ class KeyboardTeleop:
         if c in self.KEY_MAP:
             self._states[self.KEY_MAP[c]] = False
         elif c == 'z':
+            self.gripper_close_held = False
             self._z_last_release = time.monotonic()
         elif c == 'x':
+            self.gripper_open_held = False
             self._x_last_release = time.monotonic()
 
     def get_velocity(self, dt):
@@ -882,10 +895,12 @@ def main():
     print(f"  Fisheye:   {'yes' if fisheye_cam else 'no'}")
     print(f"  ZED:       {len(zed_cams)} cameras")
     print(f"  Freq:      {args.frequency} Hz")
+    print(f"  Gripper:   BINARY (press M to switch)")
     print(f"  Output:    {args.output}")
     print("=" * 60)
     print("  C = start recording, V = stop & save, B = drop")
     print("  WASD = move, Z = close gripper, X = open gripper,")
+    print("  M = toggle gripper mode (binary/continuous)")
     print("  H = home, Esc = quit")
     print("=" * 60)
 
@@ -942,6 +957,11 @@ def main():
                 target_pose = robot.get_tip_pose()
                 gripper_pos = MAX_GRIPPER_WIDTH
                 did_block = True
+            if teleop.toggle_gripper_mode:
+                teleop.toggle_gripper_mode = False
+                teleop.gripper_continuous = not teleop.gripper_continuous
+                mode_str = "CONTINUOUS (hold Z/X to step)" if teleop.gripper_continuous else "BINARY (one-press full open/close)"
+                print(f"\n[GRIPPER] Mode -> {mode_str}")
 
             # A blocking event (episode save / homing) ran the wall clock far
             # past the current schedule; re-anchor the origin so the loop does
@@ -996,7 +1016,8 @@ def main():
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, rec_color, 2)
                     pos_txt = (f'pos=[{target_pose[0]:.3f},{target_pose[1]:.3f},'
                                f'{target_pose[2]:.3f}]  gripper={gripper_meas:.3f}m '
-                               f'(cmd {gripper_pos:.3f})')
+                               f'(cmd {gripper_pos:.3f}) '
+                               f'{"[continuous]" if teleop.gripper_continuous else "[binary]"}')
                     cv2.putText(canvas, pos_txt, (10, mh - 8),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
                     cv2.imshow('Franka Collect', canvas)
@@ -1014,27 +1035,33 @@ def main():
             target_pose[3:] = (drot * st.Rotation.from_rotvec(target_pose[3:])).as_rotvec()
             robot.update_desired_ee_pose(target_pose)
 
-            # ---- gripper: full close / open, one dispatch per Z/X press edge -
-            # Z = full force-close (grasp), X = full open (release). The DOWN-edge
-            # is detected in KeyboardTeleop (auto-repeat debounced) and delivered
-            # as a one-shot request, so a single press fires exactly one motion.
-            # Dispatch is async (fire-and-forget) so the blocking gripper RPC
-            # never stalls the pose loop; gripper_pos is a pure input-driven cmd,
-            # feedback never writes it. Print only on an actual target change.
-            if teleop.gripper_close_req:
-                teleop.gripper_close_req = False
-                _async_gripper_cmd(args.robot_ip, args.robot_port, 'grasp',
-                                   speed=GRIPPER_SPEED, force=40.0)
-                if gripper_pos != 0.0:
-                    print("\n[GRIPPER] full force-close dispatched")
-                gripper_pos = 0.0
-            elif teleop.gripper_open_req:
-                teleop.gripper_open_req = False
-                _async_gripper_cmd(args.robot_ip, args.robot_port, 'release',
-                                   speed=GRIPPER_SPEED)
-                if gripper_pos != MAX_GRIPPER_WIDTH:
-                    print("\n[GRIPPER] full open dispatched")
-                gripper_pos = MAX_GRIPPER_WIDTH
+            # ---- gripper: binary or continuous, selected by M key --------
+            if teleop.gripper_continuous:
+                # Continuous: hold Z/X to step gripper at GRIPPER_SPEED
+                if teleop.gripper_close_held:
+                    gripper_pos = max(0.0, gripper_pos - GRIPPER_SPEED * dt)
+                    _async_gripper_cmd(args.robot_ip, args.robot_port, 'move',
+                                       speed=GRIPPER_SPEED, width=gripper_pos)
+                elif teleop.gripper_open_held:
+                    gripper_pos = min(MAX_GRIPPER_WIDTH, gripper_pos + GRIPPER_SPEED * dt)
+                    _async_gripper_cmd(args.robot_ip, args.robot_port, 'move',
+                                       speed=GRIPPER_SPEED, width=gripper_pos)
+            else:
+                # Binary: one Z/X press fires a full grasp / release
+                if teleop.gripper_close_held:
+                    teleop.gripper_close_held = False
+                    _async_gripper_cmd(args.robot_ip, args.robot_port, 'grasp',
+                                       speed=GRIPPER_SPEED, force=40.0)
+                    if gripper_pos != 0.0:
+                        print("\n[GRIPPER] full force-close dispatched")
+                    gripper_pos = 0.0
+                elif teleop.gripper_open_held:
+                    teleop.gripper_open_held = False
+                    _async_gripper_cmd(args.robot_ip, args.robot_port, 'release',
+                                       speed=GRIPPER_SPEED)
+                    if gripper_pos != MAX_GRIPPER_WIDTH:
+                        print("\n[GRIPPER] full open dispatched")
+                    gripper_pos = MAX_GRIPPER_WIDTH
 
             # REAL measured gripper width (server-side poller makes this a
             # non-blocking cached read); fall back to commanded on any error.
@@ -1061,8 +1088,10 @@ def main():
             if now - last_print > 0.5:
                 p = target_pose
                 rec_flag = ' [REC]' if is_recording else ''
+                g_mode = 'C' if teleop.gripper_continuous else 'B'
                 print(f"\rpos=[{p[0]:.3f},{p[1]:.3f},{p[2]:.3f}]  "
-                      f"gripper={gripper_meas:.3f}m (cmd {gripper_pos:.3f}){rec_flag}   ",
+                      f"gripper={gripper_meas:.3f}m (cmd {gripper_pos:.3f}) "
+                      f"[{g_mode}]{rec_flag}   ",
                       end='', flush=True)
                 last_print = now
 
