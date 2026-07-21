@@ -18,7 +18,7 @@
 
 SERVER_IP   = "192.168.1.100"    # GPU 推理服务器 IP（必填，按实际修改）
 SERVER_PORT = 8000               # GPU 推理服务器端口
-ROBOT_IP    = "localhost"        # franka_server.py 所在主机（通常为本机）
+ROBOT_IP    = "192.168.3.2"        # franka_server.py 所在主机（通常为本机）
 ROBOT_PORT  = 4242               # franka_server.py ZeroRPC 端口
 TIMEOUT     = 5.0                # 推理请求超时（秒）
 
