@@ -123,51 +123,47 @@ FRANKA_HOME_JOINTS = np.array([0, -0.785, 0, -2.356, 0, 1.571, 0.785])
 --cam_global zed_0 --cam_wrist zed_1 --no_fisheye --no_l515
 ```
 
-### 2.3 安全限制（工作空间标定）
+### 2.3 配置文件
 
-默认的工作空间边界是保守估计，**实验前必须标定你实际的工作空间**。
-
-**标定方法**：使用 `calibrate_workspace.py` 工具：
+所有可配置参数集中在 `leapbot/leapbot_config.py` 中，修改后直接启动即可，无需加命令行参数。
 
 ```bash
-# 先启动 polymetis + franka_server.py
+# 直接编辑
+vim leapbot_config.py
+
+# 关键参数：
+SERVER_IP   = "192.168.1.100"   # ← 必须改为你的 GPU 机器 IP
+TASK        = "move_objects_into_box"
+CAM_GLOBAL  = "zed_0"
+CAM_WRIST   = "fisheye"
+SAFETY_X_MIN = 0.25             # ← 来自标定工具输出
+SAFETY_X_MAX = 0.62             # ← 来自标定工具输出
+...
+```
+
+**优先级**：`CLI 参数 > leapbot_config.py > 硬编码默认值`
+
+可用时指定其他配置文件：
+
+```bash
+python leapbot_control.py --config ./my_experiment_config.py
+```
+
+### 2.4 工作空间标定
+
+默认的工作空间边界是保守估计，**首次实验前必须标定**。
+
+```bash
 conda activate polymetis
 cd /path/to/franka_standalone/leapbot
 python calibrate_workspace.py --robot_ip localhost --margin 0.02
 ```
 
-标定流程：
-1. 机器人自动回到 Home 位
-2. 用 WASD/QE 键手动移动机器人到工作空间的**最远允许位置**：
-   - W/S：推到最远前方 (x_max) 和最后方 (x_min)
-   - A/D：推到最左 (y_max) 和最右 (y_min)
-   - Q/E：推到最高 (z_max) 和最低 (z_min)
-3. 在每个极限位置停留约 1 秒
-4. 按 **T** 预览当前记录的边界
-5. 按 **P** 输出最终边界（可直接复制粘贴的代码）
-6. 按 **H** 随时归位，**Esc** 退出
-
-工具会自动输出如下格式，直接粘贴到 `FrankaPoseSafetyChecker` 或通过 CLI 传入：
-
-```python
-# calibrate_workspace.py 输出示例：
-    x_min=0.2500, x_max=0.6200,
-    y_min=-0.3500, y_max=0.3200,
-    z_min=0.0800, z_max=0.5000,
-```
-
-```bash
-# 或通过 CLI 传入标定结果
-python leapbot_control.py --server_ip <IP> \
-    --safety_x_min 0.25 --safety_x_max 0.62 \
-    --safety_y_min -0.35 --safety_y_max 0.32 \
-    --safety_z_min 0.08 --safety_z_max 0.50
-```
-
-**标定参数说明**：
-- `margin`（默认 0.02m）：在你到达的极限位置基础上再往内缩 2cm，避免在物理极限处运行
-- 标定时按住 **Shift** 可以 3x 速度移动，加快标定
-- 建议标定 2-3 次取交集，确保边界稳定
+流程：
+1. 机器人自动归零，用 **WASD/QE** 推到每个极限位置（W=前方, S=后方, A=左, D=右, Q=上, E=下）
+2. 每个极限位置**停留 1 秒**
+3. 按 **T** 预览边界，按 **P** 输出最终结果
+4. 将输出值填入 `leapbot_config.py` 的 `SAFETY_*` 字段
 
 ---
 
@@ -329,25 +325,25 @@ bash launch_server.sh
 
 ### 阶段 3：启动闭环控制器（首次实验 — 保守模式）
 
-在 **NUC** 终端上，使用标定得到的安全边界 + 保守控制参数：
+首次实验建议先临时修改 `leapbot_config.py` 使用保守参数：
+
+```python
+# leapbot_config.py — 首次实验临时改为：
+ACTION_HORIZON  = 1      # 纯 receding horizon，最灵活
+MAX_DELTA_POS   = 0.03   # 小步长限制
+MAX_DELTA_ROT   = 0.15
+# SAFETY_* 填入阶段 1 标定结果
+```
+
+然后启动：
 
 ```bash
 conda activate polymetis
 cd /path/to/franka_standalone/leapbot
-
-# 将标定输出的值填入下方环境变量
-SERVER_IP=<GPU机器IP> \
-ACTION_HORIZON=1 \
-MAX_DELTA_POS=0.03 \
-MAX_DELTA_ROT=0.15 \
-SAFETY_X_MIN=0.25 SAFETY_X_MAX=0.62 \
-SAFETY_Y_MIN=-0.35 SAFETY_Y_MAX=0.32 \
-SAFETY_Z_MIN=0.08 SAFETY_Z_MAX=0.50 \
-bash launch_leapbot.sh
+SERVER_IP=<GPU机器IP> bash launch_leapbot.sh
 ```
 
-> 首次实验务必用 `ACTION_HORIZON=1`（纯 receding horizon）+ 小 `MAX_DELTA_POS`，
-> 观察策略行为稳定后再逐步放宽。
+确认策略行为稳定后，改回正常参数（`ACTION_HORIZON=4`，放宽 delta 限制）。
 
 ---
 
@@ -366,16 +362,17 @@ bash launch_leapbot.sh
 
 ### 阶段 5：正式实验
 
-确认策略行为合理后，使用正常参数：
+确认策略行为合理后，恢复 `leapbot_config.py` 中的正常参数，然后启动：
 
 ```bash
-SERVER_IP=<GPU机器IP> \
-TASK=move_objects_into_box \
-ACTION_HORIZON=4 \
-SAFETY_X_MIN=0.25 SAFETY_X_MAX=0.62 \
-SAFETY_Y_MIN=-0.35 SAFETY_Y_MAX=0.32 \
-SAFETY_Z_MIN=0.08 SAFETY_Z_MAX=0.50 \
-bash launch_leapbot.sh
+SERVER_IP=<GPU机器IP> bash launch_leapbot.sh
+```
+
+或指定不同的任务/配置文件：
+
+```bash
+SERVER_IP=<GPU机器IP> TASK=press_three_buttons bash launch_leapbot.sh
+CONFIG_FILE=./exp_config_b.py SERVER_IP=<GPU机器IP> bash launch_leapbot.sh
 ```
 
 1. 按 **H** 归位
@@ -388,27 +385,26 @@ bash launch_leapbot.sh
 
 ### 切换相机配置
 
-不同任务可能需要不同的视角组合，通过环境变量切换：
+不同实验需要不同视角时，准备多个配置文件或用 CLI 覆盖：
 
 ```bash
-# 实验 A：默认视角（zed_0 全局 + fisheye 手腕）
-CAM_GLOBAL=zed_0 CAM_WRIST=fisheye bash launch_leapbot.sh
+# 方式 A：为不同实验准备不同配置文件
+cp leapbot_config.py exp_A_config.py   # 编辑 CAM_GLOBAL, CAM_WRIST 等
+cp leapbot_config.py exp_B_config.py
+CONFIG_FILE=exp_A_config.py SERVER_IP=<IP> bash launch_leapbot.sh
 
-# 实验 B：zed_1 全局 + l515_0 手腕
-CAM_GLOBAL=zed_1 CAM_WRIST=l515_0 bash launch_leapbot.sh
-
-# 实验 C：只用双 ZED，禁用 fisheye 和 L515
-CAM_GLOBAL=zed_0 CAM_WRIST=zed_1 bash launch_leapbot.sh
+# 方式 B：CLI 临时覆盖
+SERVER_IP=<IP> --cam_global zed_1 --cam_wrist l515_0 bash launch_leapbot.sh
 ```
 
 ---
 
-## 6. 启动参数速查
+## 6. 配置参数速查
 
 ### GPU 服务器（launch_server.sh / server.py）
 
-| 环境变量 / 参数 | 默认值 | 说明 |
-|----------------|--------|------|
+| 环境变量 | 默认值 | 说明 |
+|---------|--------|------|
 | `CONDA_ENV` | vj_fw | conda 环境名 |
 | `ASSET_ROOT` | /home/aihub/.../assets | FastWAM 资产目录 |
 | `TASK` | move_objects_into_box | 任务 ID |
@@ -418,24 +414,26 @@ CAM_GLOBAL=zed_0 CAM_WRIST=zed_1 bash launch_leapbot.sh
 | `PORT` | 8000 | HTTP 端口 |
 | `ENABLE_FISHEYE` | 0 | 鱼眼去畸变（1=开启）|
 
-### 机器人控制器（launch_leapbot.sh / leapbot_control.py）
+### 机器人控制器（leapbot_config.py + launch_leapbot.sh）
 
-| 环境变量 / 参数 | 默认值 | 说明 |
-|----------------|--------|------|
-| `CONDA_ENV` | polymetis | conda 环境名 |
-| `SERVER_IP` | **必填** | GPU 机器 IP |
-| `SERVER_PORT` | 8000 | GPU 推理端口 |
-| `ROBOT_IP` | localhost | franka_server.py 地址 |
-| `FRANKA_PORT` | 4242 | ZeroRPC 端口 |
-| `TASK` | move_objects_into_box | 任务 ID |
-| `FREQUENCY` | 10 | 控制频率 (Hz) |
-| `ACTION_HORIZON` | 4 | 每次推理执行步数（运行时可 +/-）|
-| `CAM_GLOBAL` | zed_0 | global_image 相机名 |
-| `CAM_WRIST` | fisheye | wrist_image 相机名 |
-| `CAM_VIS` | zed_1,l515_0 | 可视化额外相机 |
-| `MAX_DELTA_POS` | 0.08 | 单步位移限制 (m) |
-| `MAX_DELTA_ROT` | 0.3 | 单步旋转限制 (rad) |
-| `SKIP_HOME` | 0 | 跳过归零（1=跳过）|
+**主要配置**：编辑 `leapbot_config.py`，参数及默认值见该文件内注释。
+
+**launch_leapbot.sh 环境变量**（仅用于临时覆盖）：
+
+| 环境变量 | 说明 |
+|---------|------|
+| `CONFIG_FILE` | 指定其他配置文件（默认 ./leapbot_config.py）|
+| `SERVER_IP` | 覆盖 config 中的 GPU 服务器 IP |
+| `TASK` | 覆盖 config 中的任务 ID |
+| `CONDA_ENV` | NUC 侧 conda 环境名（默认 polymetis）|
+
+**CLI 覆盖**（优先级最高，直接传给 `leapbot_control.py`）：
+
+```bash
+# 任何 leapbot_config.py 中的参数都可以用 --参数名 覆盖
+python leapbot_control.py --server_ip 1.2.3.4 --action_horizon 1
+python leapbot_control.py --config ./other.py --cam_global zed_1
+```
 
 ---
 
@@ -502,6 +500,7 @@ print(result["action_chunk"].shape)  # (32, 7)
 ```
 franka_standalone/leapbot/
 ├── README.md               # 本文档
+├── leapbot_config.py       # 控制器配置文件（实验前必改）
 ├── server.py               # GPU 推理服务器（FastAPI）
 ├── launch_server.sh        # GPU 服务器启动脚本（conda vj_fw）
 ├── leapbot_client.py       # NUC 侧推理 HTTP 客户端

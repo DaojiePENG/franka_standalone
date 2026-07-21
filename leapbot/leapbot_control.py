@@ -41,6 +41,7 @@ Usage:
 """
 import argparse
 import enum
+import importlib.util
 import sys
 import threading
 import time
@@ -904,6 +905,36 @@ class LeapbotController:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  Config Loader
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _load_config(config_path):
+    """Load a Python config file and return it as a namespace object.
+
+    The file is loaded via importlib so it executes top-level assignments
+    (SERVER_IP = "…", etc.) which become attributes of the returned object.
+    Returns None if the file does not exist.
+    """
+    p = Path(config_path).expanduser()
+    if not p.exists():
+        return None
+    if not p.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location("_leapbot_config", str(p))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _cfg(ns, attr, fallback=None):
+    """Read an attribute from the config namespace, returning *fallback* if
+    the attribute is missing or the namespace is None."""
+    if ns is None:
+        return fallback
+    return getattr(ns, attr, fallback)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  CLI
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -925,55 +956,105 @@ Keyboard Controls (during execution):
   M        Print current state to terminal
   Q        Quit gracefully
 
-Camera names available at runtime depend on which cameras are connected.
-Use --cam_global and --cam_wrist to map them to model views.
-Default: --cam_global zed_0 --cam_wrist fisheye
+Priority: CLI arguments > config file > built-in defaults.
+Config file: --config  (default: ./leapbot_config.py)
 """)
 
-    # Network
-    parser.add_argument("--robot_ip",    default=ROBOT_IP)
-    parser.add_argument("--robot_port",  type=int, default=ROBOT_PORT)
-    parser.add_argument("--server_ip",   required=True,
-                        help="GPU machine IP (where server.py is running)")
-    parser.add_argument("--server_port", type=int, default=8000)
-    parser.add_argument("--timeout",     type=float, default=5.0)
+    # ── Parse only --config first ─────────────────────────────────────────────
+    parser.add_argument(
+        "--config", default=None,
+        help="Path to leapbot_config.py (default: ./leapbot_config.py)")
 
-    # Task / control
-    parser.add_argument("--task",       default="move_objects_into_box")
-    parser.add_argument("--frequency",  type=int, default=CONTROL_FREQUENCY)
-    parser.add_argument("--action_horizon", type=int, default=4,
-                        help="Actions per inference (adjustable at runtime with +/-)")
+    # ── Network ───────────────────────────────────────────────────────────────
+    parser.add_argument("--robot_ip",    default=None)
+    parser.add_argument("--robot_port",  type=int, default=None)
+    parser.add_argument("--server_ip",   default=None)
+    parser.add_argument("--server_port", type=int, default=None)
+    parser.add_argument("--timeout",     type=float, default=None)
 
-    # Camera → model view mapping
-    parser.add_argument("--cam_global", default="zed_0",
-                        help="Camera name for global_image (default: zed_0)")
-    parser.add_argument("--cam_wrist",  default="fisheye",
-                        help="Camera name for wrist_image (default: fisheye)")
-    parser.add_argument("--cam_vis",    default="zed_1,l515_0",
-                        help="Comma-separated extra camera names for "
-                             "visualization (default: zed_1,l515_0)")
+    # ── Task / control ────────────────────────────────────────────────────────
+    parser.add_argument("--task",       default=None)
+    parser.add_argument("--frequency",  type=int, default=None)
+    parser.add_argument("--action_horizon", type=int, default=None)
 
-    # Camera disable flags
-    parser.add_argument("--no_l515",    action="store_true")
-    parser.add_argument("--no_fisheye", action="store_true")
-    parser.add_argument("--no_zed",     action="store_true")
+    # ── Camera → model view mapping ───────────────────────────────────────────
+    parser.add_argument("--cam_global", default=None)
+    parser.add_argument("--cam_wrist",  default=None)
+    parser.add_argument("--cam_vis",    default=None)
 
-    # Safety
-    parser.add_argument("--max_delta_pos", type=float, default=0.08,
-                        help="Max single-step position change (m)")
-    parser.add_argument("--max_delta_rot", type=float, default=0.3,
-                        help="Max single-step rotation change (rad)")
-    parser.add_argument("--skip_home", action="store_true",
-                        help="Skip the joint-home reset on startup")
-    # Workspace bounds (from calibrate_workspace.py output)
-    parser.add_argument("--safety_x_min", type=float, default=0.20)
-    parser.add_argument("--safety_x_max", type=float, default=0.70)
-    parser.add_argument("--safety_y_min", type=float, default=-0.40)
-    parser.add_argument("--safety_y_max", type=float, default=0.40)
-    parser.add_argument("--safety_z_min", type=float, default=0.05)
-    parser.add_argument("--safety_z_max", type=float, default=0.60)
+    # ── Camera disable flags ──────────────────────────────────────────────────
+    parser.add_argument("--no_l515",    action="store_true", default=None)
+    parser.add_argument("--no_fisheye", action="store_true", default=None)
+    parser.add_argument("--no_zed",     action="store_true", default=None)
+
+    # ── Safety ────────────────────────────────────────────────────────────────
+    parser.add_argument("--max_delta_pos", type=float, default=None)
+    parser.add_argument("--max_delta_rot", type=float, default=None)
+    parser.add_argument("--skip_home", action="store_true", default=None)
+
+    # ── Workspace bounds ──────────────────────────────────────────────────────
+    parser.add_argument("--safety_x_min", type=float, default=None)
+    parser.add_argument("--safety_x_max", type=float, default=None)
+    parser.add_argument("--safety_y_min", type=float, default=None)
+    parser.add_argument("--safety_y_max", type=float, default=None)
+    parser.add_argument("--safety_z_min", type=float, default=None)
+    parser.add_argument("--safety_z_max", type=float, default=None)
 
     args = parser.parse_args()
+
+    # ── Load config file ──────────────────────────────────────────────────────
+    config_path = args.config
+    if config_path is None:
+        config_path = Path(__file__).resolve().parent / "leapbot_config.py"
+    cfg = _load_config(config_path)
+    if cfg is not None:
+        print(f"[Config] Loaded: {config_path}")
+    else:
+        if args.config is not None:
+            print(f"[Config] WARNING: file not found: {config_path}")
+        # No config file and no explicit --config: use built-in defaults
+        cfg = _load_config(None)  # returns None; _cfg will use fallback
+
+    # ── Fill None args from config, then from built-in defaults ───────────────
+    def _get(cli_val, cfg_attr, builtin):
+        """CLI → config → built-in."""
+        if cli_val is not None:
+            return cli_val
+        return _cfg(cfg, cfg_attr, builtin)
+
+    args.server_ip     = _get(args.server_ip,     "SERVER_IP",   None)
+    args.server_port   = _get(args.server_port,   "SERVER_PORT", 8000)
+    args.robot_ip      = _get(args.robot_ip,      "ROBOT_IP",    ROBOT_IP)
+    args.robot_port    = _get(args.robot_port,     "ROBOT_PORT",  ROBOT_PORT)
+    args.timeout       = _get(args.timeout,        "TIMEOUT",     5.0)
+    args.task          = _get(args.task,           "TASK",        "move_objects_into_box")
+    args.frequency     = _get(args.frequency,      "FREQUENCY",   CONTROL_FREQUENCY)
+    args.action_horizon= _get(args.action_horizon, "ACTION_HORIZON", 4)
+    args.cam_global    = _get(args.cam_global,     "CAM_GLOBAL",  "zed_0")
+    args.cam_wrist     = _get(args.cam_wrist,      "CAM_WRIST",   "fisheye")
+    args.cam_vis       = _get(args.cam_vis,        "CAM_VIS",     "zed_1,l515_0")
+    args.max_delta_pos = _get(args.max_delta_pos,  "MAX_DELTA_POS", 0.08)
+    args.max_delta_rot = _get(args.max_delta_rot,  "MAX_DELTA_ROT", 0.3)
+    args.skip_home     = _get(args.skip_home,      "SKIP_HOME",   False)
+    args.safety_x_min  = _get(args.safety_x_min,   "SAFETY_X_MIN", 0.20)
+    args.safety_x_max  = _get(args.safety_x_max,   "SAFETY_X_MAX", 0.70)
+    args.safety_y_min  = _get(args.safety_y_min,   "SAFETY_Y_MIN", -0.40)
+    args.safety_y_max  = _get(args.safety_y_max,   "SAFETY_Y_MAX", 0.40)
+    args.safety_z_min  = _get(args.safety_z_min,   "SAFETY_Z_MIN", 0.05)
+    args.safety_z_max  = _get(args.safety_z_max,   "SAFETY_Z_MAX", 0.60)
+
+    # Boolean disable flags: store_true with None default means the CLI flag
+    # was NOT given.  Fall back to config, then False.
+    args.no_l515    = args.no_l515    or _cfg(cfg, "NO_L515",    False)
+    args.no_fisheye = args.no_fisheye or _cfg(cfg, "NO_FISHEYE", False)
+    args.no_zed     = args.no_zed     or _cfg(cfg, "NO_ZED",     False)
+
+    # ── Validate required ─────────────────────────────────────────────────────
+    if args.server_ip is None:
+        parser.error(
+            "--server_ip is required (not set in CLI or config file).\n"
+            "Set SERVER_IP in leapbot_config.py or pass --server_ip on CLI.")
+
     controller = LeapbotController(args)
     controller.run()
 
