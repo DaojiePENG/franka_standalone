@@ -258,7 +258,7 @@ class KeyboardTeleop:
         'u': 'rol_l', 'o': 'rol_r',
     }
 
-    def __init__(self, pos_speed=0.08, rot_speed=0.3, speed_mult=3.0):
+    def __init__(self, pos_speed=0.08, rot_speed=0.3, speed_mult=2.0):
         self.pos_speed = pos_speed
         self.rot_speed = rot_speed
         self.speed_mult = float(speed_mult)
