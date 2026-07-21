@@ -1,38 +1,42 @@
 #!/usr/bin/env bash
 # ──────────────────────────────────────────────────────────────────────────────
-# LeapBot NUC-side launcher
+# LeapBot launcher — connects to an already-running franka_server.py
+#
+# franka_server.py must be running on the NUC beforehand (started via
+# polymetis / launch_robot.py or equivalent).  This script only launches
+# leapbot_control.py which connects to the Franka server via ZeroRPC.
 #
 # 配置优先级：环境变量 > leapbot_config.py > 脚本内置默认值
 #
-# 大部分参数在 leapbot_config.py 中配置即可，以下环境变量可临时覆盖：
+# 环境变量可临时覆盖：
 #   CONFIG_FILE    — 配置文件路径（默认 ./leapbot_config.py）
 #   SERVER_IP      — GPU 推理服务器 IP（覆盖 config 中的 SERVER_IP）
 #   TASK           — 任务 ID（覆盖 config 中的 TASK）
-#   CONDA_ENV      — NUC 侧 conda 环境名（默认 polymetis）
+#   CONDA_ENV      — conda 环境名（默认 umi）
 #
 # 使用方式：
-#   SERVER_IP=192.168.1.100 bash launch_leapbot.sh                    # 最简
-#   CONFIG_FILE=./my_exp_config.py bash launch_leapbot.sh             # 指定配置
-#   SERVER_IP=1.2.3.4 TASK=press_three_buttons bash launch_leapbot.sh # 临时覆盖
+#   bash launch_leapbot.sh                                           # 最简
+#   CONFIG_FILE=config_press_three_buttons.py bash launch_leapbot.sh # 指定配置
+#   SERVER_IP=1.2.3.4 TASK=press_three_buttons bash launch_leapbot.sh
 # ──────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-FRANKA_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # ── Activate conda environment ────────────────────────────────────────────────
-CONDA_ENV="${CONDA_ENV:-polymetis}"
+CONDA_ENV="${CONDA_ENV:-umi}"
 _CONDA_BASE="$(conda info --base 2>/dev/null || echo "${HOME}/miniconda3")"
 if [[ -f "${_CONDA_BASE}/etc/profile.d/conda.sh" ]]; then
     source "${_CONDA_BASE}/etc/profile.d/conda.sh"
 elif [[ -f "/opt/conda/etc/profile.d/conda.sh" ]]; then
     source "/opt/conda/etc/profile.d/conda.sh"
 fi
+set +u  # conda activate.d scripts reference unset vars (e.g. MKL_INTERFACE_LAYER)
 conda activate "$CONDA_ENV"
+set -u
 
 # ── Franka server settings ────────────────────────────────────────────────────
-ROBOT_IP="${ROBOT_IP:-localhost}"
-GRIPPER_ROBOT_IP="${GRIPPER_ROBOT_IP:-10.168.1.200}"
+ROBOT_IP="${ROBOT_IP:-192.168.3.2}"
 FRANKA_PORT="${FRANKA_PORT:-4242}"
 
 # ── Config file ───────────────────────────────────────────────────────────────
@@ -45,7 +49,7 @@ OVERRIDES=()
 
 # ── Info ──────────────────────────────────────────────────────────────────────
 echo "================================================================="
-echo "  LeapBot NUC Launcher"
+echo "  LeapBot Launcher"
 echo "  CONDA ENV    : ${CONDA_ENV}"
 echo "  Franka server: ${ROBOT_IP}:${FRANKA_PORT}"
 echo "  Config file  : ${CONFIG_FILE:-<default leapbot_config.py>}"
@@ -53,33 +57,27 @@ echo "  Config file  : ${CONFIG_FILE:-<default leapbot_config.py>}"
 echo "================================================================="
 echo ""
 
-# ── Start franka_server.py ────────────────────────────────────────────────────
-echo "[Step 1] Starting franka_server.py ..."
-cd "$FRANKA_DIR"
-python franka_server.py \
-    --robot_ip         "$ROBOT_IP" \
-    --gripper_robot_ip "$GRIPPER_ROBOT_IP" \
-    --port             "$FRANKA_PORT" \
-    &
-FRANKA_PID=$!
-
-echo "[Step 1] Waiting for franka_server on port ${FRANKA_PORT} ..."
-for i in $(seq 1 30); do
-    if python -c "import zerorpc; c=zerorpc.Client(heartbeat=5); c.connect('tcp://localhost:${FRANKA_PORT}'); c.close()" 2>/dev/null; then
-        echo "[Step 1] franka_server ready ✓"
-        break
-    fi
-    sleep 2
-    if [ "$i" -eq 30 ]; then
-        echo "[ERROR] franka_server did not start after 60s"
-        kill $FRANKA_PID 2>/dev/null || true
-        exit 1
-    fi
-done
+# ── Pre-flight: check franka_server is reachable ──────────────────────────────
+echo "[Pre-flight] Checking franka_server on ${ROBOT_IP}:${FRANKA_PORT} ..."
+if ! python -c "
+import zerorpc, sys
+c = zerorpc.Client(timeout=5, heartbeat=5)
+try:
+    c.connect('tcp://${ROBOT_IP}:${FRANKA_PORT}')
+    c.close()
+except Exception as e:
+    print(f'[ERROR] Cannot reach franka_server: {e}', file=sys.stderr)
+    sys.exit(1)
+" 2>&1; then
+    echo "[ERROR] franka_server not reachable at ${ROBOT_IP}:${FRANKA_PORT}."
+    echo "        Start franka_server.py on the NUC first."
+    exit 1
+fi
+echo "[Pre-flight] franka_server reachable ✓"
 
 # ── Start leapbot_control.py ─────────────────────────────────────────────────
 echo ""
-echo "[Step 2] Starting leapbot_control.py ..."
+echo "[Step 1] Starting leapbot_control.py ..."
 cd "$SCRIPT_DIR"
 
 CONTROLLER_ARGS=(
@@ -98,9 +96,6 @@ cleanup() {
     echo "[Cleanup] Stopping controller (PID=$CONTROL_PID) ..."
     kill $CONTROL_PID 2>/dev/null || true
     wait $CONTROL_PID 2>/dev/null || true
-    echo "[Cleanup] Stopping franka_server (PID=$FRANKA_PID) ..."
-    kill $FRANKA_PID 2>/dev/null || true
-    wait $FRANKA_PID 2>/dev/null || true
     echo "[Cleanup] Done."
 }
 trap cleanup EXIT INT TERM

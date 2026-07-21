@@ -392,6 +392,16 @@ class LeapbotController:
         self.action_horizon = args.action_horizon
         self.mock = getattr(args, 'mock', False)
 
+        # Build action sign array for axis flipping (zero-shot transfer)
+        flip_str = getattr(args, 'action_flip_axes', '') or ''
+        self._action_signs = np.ones(6)  # [dx, dy, dz, drx, dry, drz]
+        _flip_map = {'x': 0, 'y': 1, 'z': 2}
+        for axis in flip_str.lower().replace(' ', '').split(','):
+            if axis in _flip_map:
+                idx = _flip_map[axis]
+                self._action_signs[idx] = -1.0
+                self._action_signs[idx + 3] = -1.0  # flip rotation too
+
         # Camera → model view mapping (resolved at camera init time)
         self.cam_global = args.cam_global    # e.g. "zed_0"
         self.cam_wrist  = args.cam_wrist     # e.g. "fisheye"
@@ -755,6 +765,10 @@ class LeapbotController:
         print("  Frequency      : {} Hz".format(args.frequency))
         print("  global_image   : {}".format(self.cam_global))
         print("  wrist_image    : {}".format(self.cam_wrist))
+        if args.action_scale != 1.0:
+            print("  Action scale   : {}x".format(args.action_scale))
+        if args.action_flip_axes:
+            print("  Action flip    : {}".format(args.action_flip_axes))
         print("  Safety         : delta_pos≤{}m  delta_rot≤{}rad".format(
             args.max_delta_pos, args.max_delta_rot))
         print("=" * 60)
@@ -842,6 +856,21 @@ class LeapbotController:
                         else:
                             action_chunk = result["action_chunk"]
                             infer_ms = result["latency_ms"]
+
+                            # Print raw policy output (before scale/flip)
+                            n_show = min(4, action_chunk.shape[0])
+                            print(f"\n[Raw] shape={action_chunk.shape}, showing {n_show} steps:")
+                            for _i in range(n_show):
+                                _a = action_chunk[_i]
+                                print(f"  step {_i}: dx={_a[0]:+.4f} dy={_a[1]:+.4f} dz={_a[2]:+.4f} "
+                                      f"drx={_a[3]:+.4f} dry={_a[4]:+.4f} drz={_a[5]:+.4f} "
+                                      f"grip={_a[6]:.4f}")
+
+                            # Apply action scale & axis flip (zero-shot transfer)
+                            scale = getattr(args, 'action_scale', 1.0)
+                            if scale != 1.0:
+                                action_chunk[:, :6] *= scale
+                            action_chunk[:, :6] *= self._action_signs
 
                             if is_mock:
                                 # Mock: print predicted actions, don't execute
@@ -1043,6 +1072,10 @@ Config file: --config  (default: ./leapbot_config.py)
     parser.add_argument("--task",       default=None)
     parser.add_argument("--frequency",  type=int, default=None)
     parser.add_argument("--action_horizon", type=int, default=None)
+    parser.add_argument("--action_scale", type=float, default=None,
+                        help="Scale factor for policy actions (e.g. 0.15 for zero-shot transfer)")
+    parser.add_argument("--action_flip_axes", default=None,
+                        help="Axes to flip, e.g. 'z' or 'x,y' (for different robot coordinate frames)")
 
     # ── Camera → model view mapping ───────────────────────────────────────────
     parser.add_argument("--cam_global", default=None)
@@ -1102,6 +1135,8 @@ Config file: --config  (default: ./leapbot_config.py)
     args.task          = _get(args.task,           "TASK",        "move_objects_into_box")
     args.frequency     = _get(args.frequency,      "FREQUENCY",   CONTROL_FREQUENCY)
     args.action_horizon= _get(args.action_horizon, "ACTION_HORIZON", 4)
+    args.action_scale  = _get(args.action_scale,   "ACTION_SCALE",  1.0)
+    args.action_flip_axes = _get(args.action_flip_axes, "ACTION_FLIP_AXES", "")
     args.cam_global    = _get(args.cam_global,     "CAM_GLOBAL",  "zed_0")
     args.cam_wrist     = _get(args.cam_wrist,      "CAM_WRIST",   "fisheye")
     args.cam_vis       = _get(args.cam_vis,        "CAM_VIS",     "zed_1,l515_0")

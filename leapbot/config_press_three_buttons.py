@@ -28,17 +28,25 @@ NO_L515    = False
 NO_FISHEYE = False
 NO_ZED     = False
 
+# 动作缩放（zero-shot 跨机器人时需要缩小策略输出幅度）
+# 原始 delta ≈ 0.3m → scale=0.15 → 实际 ≈ 0.045m
+ACTION_SCALE = 0.15
+
+# 坐标轴翻转（不同机械臂坐标系可能方向不同）
+# 可选: "x", "y", "z", "x,y", "x,z" 等组合
+ACTION_FLIP_AXES = "z"
+
 # 安全限制
 MAX_DELTA_POS = 0.08
 MAX_DELTA_ROT = 0.3
 
-# 工作空间边界（标定后填入）
+# 工作空间边界
 SAFETY_X_MIN = 0.25
 SAFETY_X_MAX = 0.70
 SAFETY_Y_MIN = -0.30
 SAFETY_Y_MAX = 0.30
 SAFETY_Z_MIN = 0.03
-SAFETY_Z_MAX = 0.40
+SAFETY_Z_MAX = 0.45
 
 # 启动行为
 SKIP_HOME = False

@@ -377,6 +377,9 @@ SERVER_IP=<GPU机器IP> bash launch_leapbot.sh
 ```bash
 SERVER_IP=<GPU机器IP> TASK=press_three_buttons bash launch_leapbot.sh
 CONFIG_FILE=./exp_config_b.py SERVER_IP=<GPU机器IP> bash launch_leapbot.sh
+CONFIG_FILE=config_move_objects_into_box.py bash launch_leapbot.sh
+CONFIG_FILE=config_press_three_buttons.py bash launch_leapbot.sh
+
 ```
 
 1. 按 **H** 归位
